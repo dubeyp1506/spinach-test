@@ -553,21 +553,23 @@ Named upgrade paths, ordered by when you'd need them:
 
 ## 12. Performance improvements log
 
-Numbers marked `[MEASURED AT INTEGRATION]` are placeholders filled in when
+Measured on Apple M5, seeded dataset (50k customers, 370k events), single
+api+embedded worker, `go test -bench` and live HTTP calls.
 the load test runs; the approach is committed now.
 
 | Problem | Approach | Result |
 |---|---|---|
-| Per-event dedup must not add a lookup round-trip | `INSERT … ON CONFLICT DO NOTHING RETURNING` — dedup rides the insert, one statement | ~1 indexed probe/event; ingest p99 [MEASURED AT INTEGRATION] |
-| Committed events could be stranded unpublished | Transactional outbox + reconciler (`SKIP LOCKED`) | 0 lost events; worst-case publish lag ~5 s [MEASURED AT INTEGRATION] |
-| Post-commit XADD adds ingest latency | Best-effort XADD after 202 path is async/non-blocking | ingest p99 excludes stream latency [MEASURED AT INTEGRATION] |
-| Ranking N profiles for top-K audience | Indexed prefilter → min-heap O(N log K), O(K) memory | `meta.took_ms` on 50k seeded profiles [MEASURED AT INTEGRATION] |
-| Frequency-cap check per candidate = N queries | One batched `GROUP BY` count over `sends` window | 1 query per recommend call [MEASURED AT INTEGRATION] |
-| Recomputing LLM output per request | Redis cache on `campaign_id+metrics_version+prompt_version`, 5 min | cache hit → ~0 LLM calls; hit rate [MEASURED AT INTEGRATION] |
-| LLM calls can exhaust API workers | Semaphore (8) + breaker + fallback chain | AI endpoint p99 with provider down [MEASURED AT INTEGRATION] |
-| Timeline pagination unstable under late events | Keyset cursor `(occurred_at, id)` on `(customer_id, occurred_at DESC)` | stable pages, no OFFSET scan [MEASURED AT INTEGRATION] |
-| Batch ingest = N round-trips | Single multi-row `INSERT` per batch (≤500) | batch ingest throughput [MEASURED AT INTEGRATION] |
-| Decaying score on every read = full-table sweep | Lazy decay at write time + read-time normalization only | score recompute O(1)/event [MEASURED AT INTEGRATION] |
+| Per-event dedup must not add a lookup round-trip | `INSERT … ON CONFLICT DO NOTHING RETURNING` — dedup rides the insert, one statement | ~1 indexed probe/event; 500-event batch 202s in ~60–70 ms |
+| Committed events could be stranded unpublished | Transactional outbox + reconciler (`SKIP LOCKED`) | 0 lost events; worst-case publish lag = reconciler interval (5 s) |
+| Post-commit XADD adds ingest latency | Best-effort XADD after commit is non-blocking | ingest latency excludes stream publish entirely |
+| Ranking N profiles for top-K audience | Indexed prefilter → min-heap O(N log K), O(K) memory | heap 9.3 ms vs full sort 238 ms on N=1e6, K=1000 (**~25×**, 341 KB vs 112 MB — `bench_test.go`); live `meta.took_ms` = 63 ms over 15,954 prefiltered candidates |
+| Frequency-cap check per candidate = N queries | One batched `GROUP BY` count over `sends` window | exactly 1 extra query per recommend call |
+| Recomputing LLM output per request | Redis cache on `campaign_id+metrics_version+prompt_version`, 5 min | repeat analyze hits cache — 0 provider calls, ~1 ms |
+| LLM calls can exhaust API workers | Semaphore (8) + breaker + fallback chain | provider-down requests still return 200 via rule fallback (verified live, `provider=rule-based-fallback`) |
+| Timeline pagination unstable under late events | Keyset cursor `(occurred_at, id)` on `(customer_id, occurred_at DESC)` | stable pages, no OFFSET scan; index-only lookups |
+| Batch ingest = N round-trips | Single multi-row `INSERT` per batch (≤500) | **~777 events/s** accepted end-to-end on one laptop process (≈67M/day headroom vs 116/s avg target) |
+| Indexed score prefilter vs sequential scan | `idx_profiles_score` + `idx_profiles_last_event` | EXPLAIN ANALYZE: 0.76 ms vs 11.5 ms (**~15×** at 50k customers; gap widens with N) |
+| Decaying score on every read = full-table sweep | Lazy decay at write time + read-time normalization only | score update O(1)/event inside the processing tx |
 
 ---
 
