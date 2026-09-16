@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS sends;
+DROP TABLE IF EXISTS engagement_profiles;
+DROP TABLE IF EXISTS events_dlq;
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS campaigns;
+DROP TABLE IF EXISTS customers;

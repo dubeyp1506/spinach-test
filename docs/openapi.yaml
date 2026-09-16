@@ -1,0 +1,198 @@
+openapi: 3.0.3
+info:
+  title: MarTech Intelligence & Campaign Decision Engine
+  version: 1.0.0
+  description: Backend-first MarTech platform — event ingestion, customer intelligence, audience recommendation, AI campaign analysis.
+servers:
+  - url: /api/v1
+paths:
+  /events:
+    post:
+      summary: Ingest marketing events (async, idempotent)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EventBatchRequest'}
+      responses:
+        '202': {description: Accepted, content: {application/json: {schema: {$ref: '#/components/schemas/EventBatchResponse'}}}}
+        '400': {description: Malformed request}
+  /customers/{id}:
+    get:
+      summary: Customer engagement profile + live score
+      parameters: [{$ref: '#/components/parameters/externalId'}]
+      responses:
+        '200': {description: CustomerProfile}
+        '404': {description: Not found}
+  /customers/{id}/timeline:
+    get:
+      summary: Customer event timeline (cursor-paginated, newest first)
+      parameters:
+        - {$ref: '#/components/parameters/externalId'}
+        - {name: limit, in: query, schema: {type: integer, default: 50, maximum: 200}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: channel, in: query, schema: {$ref: '#/components/schemas/Channel'}}
+        - {name: type, in: query, schema: {$ref: '#/components/schemas/EventType'}}
+      responses:
+        '200': {description: ListResponse<Event>}
+  /campaigns:
+    get:
+      summary: List campaigns with summary metrics
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [draft, active, paused, completed]}}
+        - {name: channel, in: query, schema: {$ref: '#/components/schemas/Channel'}}
+        - {name: limit, in: query, schema: {type: integer}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: ListResponse<Campaign>}
+  /campaigns/{id}/analytics:
+    get:
+      summary: Campaign metrics (sends, rates, per-channel breakdown, anomalies)
+      parameters: [{$ref: '#/components/parameters/externalId'}]
+      responses:
+        '200': {description: CampaignMetrics}
+        '404': {description: Not found}
+  /audience/recommend:
+    post:
+      summary: Ranked audience recommendation (top-K, dedup, frequency-capped)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AudienceRequest'}
+      responses:
+        '200': {description: AudienceResponse}
+  /campaigns/{id}/analyze:
+    post:
+      summary: AI analysis of campaign performance (facts + LLM insight + fallback)
+      parameters: [{$ref: '#/components/parameters/externalId'}]
+      responses:
+        '200': {description: AIAnalysisResponse}
+  /campaigns/{id}/recommend:
+    post:
+      summary: AI recommendations for a campaign objective
+      parameters: [{$ref: '#/components/parameters/externalId'}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {objective: {type: string}}
+      responses:
+        '200': {description: AIRecommendResponse}
+  /system/health:
+    get:
+      summary: System health (postgres, redis, queue depth, dlq size)
+      responses:
+        '200': {description: Health status}
+        '503': {description: Degraded}
+  /system/dlq:
+    get:
+      summary: Failed events (cursor-paginated)
+      parameters:
+        - {name: limit, in: query, schema: {type: integer}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: ListResponse<DLQEntry>}
+  /system/dlq/{id}/replay:
+    post:
+      summary: Replay a DLQ entry back onto the events stream
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: Replayed}
+        '404': {description: Not found}
+components:
+  parameters:
+    externalId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+      description: Row external_id (e.g. cust_00042, camp_007)
+  schemas:
+    Channel: {type: string, enum: [email, sms, whatsapp, push, web]}
+    EventType: {type: string, enum: [sent, delivered, opened, clicked, converted, bounced, unsubscribed, complained]}
+    Event:
+      type: object
+      required: [event_id, customer_id, channel, type, occurred_at]
+      properties:
+        event_id: {type: string}
+        customer_id: {type: string}
+        campaign_id: {type: string}
+        channel: {$ref: '#/components/schemas/Channel'}
+        type: {$ref: '#/components/schemas/EventType'}
+        occurred_at: {type: string, format: date-time}
+        payload: {type: object}
+    EventBatchRequest:
+      type: object
+      required: [events]
+      properties:
+        events: {type: array, items: {$ref: '#/components/schemas/Event'}, maxItems: 500}
+    EventBatchResponse:
+      type: object
+      properties:
+        accepted: {type: integer}
+        duplicates: {type: integer}
+        rejected: {type: array, items: {type: object, properties: {index: {type: integer}, reason: {type: string}}}}
+    AudienceRequest:
+      type: object
+      required: [objective, channel, size]
+      properties:
+        objective: {type: string, enum: [conversion, engagement, retention, reactivation, awareness]}
+        channel: {$ref: '#/components/schemas/Channel'}
+        size: {type: integer, minimum: 1, maximum: 100000}
+        conditions:
+          type: object
+          properties:
+            min_score: {type: number}
+            last_active_days: {type: integer}
+            channels: {type: array, items: {$ref: '#/components/schemas/Channel'}}
+            exclude_campaign_ids: {type: array, items: {type: string}}
+            respect_frequency_cap: {type: boolean, default: true}
+    AudienceResponse:
+      type: object
+      properties:
+        candidates:
+          type: array
+          items:
+            type: object
+            properties:
+              customer_id: {type: string}
+              score: {type: number}
+              rank: {type: integer}
+              reasons: {type: array, items: {type: string}}
+        meta:
+          type: object
+          properties:
+            candidates_considered: {type: integer}
+            filtered_out: {type: integer}
+            took_ms: {type: integer}
+    AIAnalysisResponse:
+      type: object
+      properties:
+        facts: {type: object, description: Deterministic metrics computed in code}
+        analysis:
+          type: object
+          properties:
+            summary: {type: string}
+            strengths: {type: array, items: {type: string}}
+            weaknesses: {type: array, items: {type: string}}
+            anomalies: {type: array, items: {type: string}}
+            confidence: {type: number}
+        provider: {type: string}
+        fallback_used: {type: boolean}
+    AIRecommendResponse:
+      type: object
+      properties:
+        facts: {type: object}
+        recommendations:
+          type: array
+          items:
+            type: object
+            properties:
+              area: {type: string, description: audience|channel|timing|segmentation|strategy|risk}
+              suggestion: {type: string}
+              reasoning: {type: string}
+              confidence: {type: number}
+        provider: {type: string}
+        fallback_used: {type: boolean}

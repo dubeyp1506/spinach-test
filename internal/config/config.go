@@ -1,0 +1,70 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
+
+type Config struct {
+	Port        int
+	Env         string
+	DatabaseURL string
+	RedisURL    string
+
+	WorkerConsumerGroup string
+	WorkerBatchSize     int64
+	WorkerMaxAttempts   int
+	WorkerClaimIdleMs   int64
+
+	LLMPrimary   string // "groq" | "gemini"
+	GroqAPIKey   string
+	GroqModel    string
+	GeminiAPIKey string
+	GeminiModel  string
+	LLMTimeoutMs int
+
+	RateLimitRPS   int
+	RateLimitBurst int
+}
+
+func Load() (*Config, error) {
+	c := &Config{
+		Port:                envInt("PORT", 8080),
+		Env:                 envStr("ENV", "development"),
+		DatabaseURL:         envStr("DATABASE_URL", "postgres://martech:martech@localhost:5432/martech?sslmode=disable"),
+		RedisURL:            envStr("REDIS_URL", "redis://localhost:6379/0"),
+		WorkerConsumerGroup: envStr("WORKER_CONSUMER_GROUP", "event-workers"),
+		WorkerBatchSize:     int64(envInt("WORKER_BATCH_SIZE", 100)),
+		WorkerMaxAttempts:   envInt("WORKER_MAX_ATTEMPTS", 5),
+		WorkerClaimIdleMs:   int64(envInt("WORKER_CLAIM_IDLE_MS", 30000)),
+		LLMPrimary:          envStr("LLM_PRIMARY", "groq"),
+		GroqAPIKey:          envStr("GROQ_API_KEY", ""),
+		GroqModel:           envStr("GROQ_MODEL", "llama-3.1-8b-instant"),
+		GeminiAPIKey:        envStr("GEMINI_API_KEY", ""),
+		GeminiModel:         envStr("GEMINI_MODEL", "gemini-1.5-flash"),
+		LLMTimeoutMs:        envInt("LLM_TIMEOUT_MS", 15000),
+		RateLimitRPS:        envInt("RATE_LIMIT_RPS", 500),
+		RateLimitBurst:      envInt("RATE_LIMIT_BURST", 1000),
+	}
+	if c.DatabaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is required")
+	}
+	return c, nil
+}
+
+func envStr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
