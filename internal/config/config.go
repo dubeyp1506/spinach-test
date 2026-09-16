@@ -26,6 +26,10 @@ type Config struct {
 
 	RateLimitRPS   int
 	RateLimitBurst int
+
+	// Demo topology: run the event worker as a goroutine inside the api
+	// binary so free-tier single-service deploys still process events.
+	RunEmbeddedWorker bool
 }
 
 func Load() (*Config, error) {
@@ -46,6 +50,7 @@ func Load() (*Config, error) {
 		LLMTimeoutMs:        envInt("LLM_TIMEOUT_MS", 15000),
 		RateLimitRPS:        envInt("RATE_LIMIT_RPS", 500),
 		RateLimitBurst:      envInt("RATE_LIMIT_BURST", 1000),
+		RunEmbeddedWorker:   envStr("RUN_EMBEDDED_WORKER", "false") == "true",
 	}
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")

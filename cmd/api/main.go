@@ -20,6 +20,9 @@ func main() {
 	}
 
 	ctx := context.Background()
+	if err := store.RunMigrations(cfg.DatabaseURL); err != nil {
+		slog.Warn("migrations", "err", err)
+	}
 	pool, err := store.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
 		slog.Error("postgres", "err", err)

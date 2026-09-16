@@ -15,7 +15,7 @@ change, update this file in the same PR that changes the code.
 | A4 Campaigns | `internal/campaigns/**` | core, store |
 | A5 AI | `internal/ai/**` | core, `campaigns.AnalyticsService` interface |
 | A6 Data gen | `cmd/seed/**`, `scripts/**` | migrations (schema) |
-| A7 Tests | `tests/**`, `internal/**/*_test.go` for cross-cutting cases | all |
+| A7 Tests | `tests/**` ONLY (integration, race, failure, API tests). Module agents own their own `internal/**/*_test.go` unit tests — A7 never edits them | all |
 | A8 Frontend | `web/**` | openapi.yaml |
 | A9 Docs/DevOps | `docs/SYSTEM_DESIGN.md`, `docs/AI_DESIGN.md`, `README.md`, deploy configs | all |
 
@@ -50,18 +50,47 @@ Rules:
   per-item rejection in `rejected[]`; valid items still accepted. Whole-request
   JSON malformed → 400.
 - Duplicate `event_id` → counted in `duplicates`, NOT an error (idempotent).
-- Dedup: Redis `SETNX` fast-path + `events.event_id UNIQUE` as source of truth.
-- After insert (`status='pending'`) → `XADD stream:events` → workers process.
+- **Dedup authority order: PostgreSQL `events.event_id UNIQUE` is the ONLY
+  authority.** `INSERT ... ON CONFLICT DO NOTHING RETURNING id`; no row
+  returned ⇒ duplicate. Redis `SETNX` may be set AFTER successful commit as a
+  read-optimization, but must NEVER be used to classify duplicates (a stale
+  Redis key must not suppress a legitimate retry).
+- **Transactional outbox (REQUIRED):** in the SAME transaction as the events
+  insert, `INSERT INTO event_outbox(event_db_id)`. After commit, the handler
+  does a best-effort `XADD stream:events` for low latency (ignore failure).
+  A reconciler loop (runs in the worker process) every ~5s:
+  `SELECT ... FROM event_outbox WHERE published_at IS NULL FOR UPDATE SKIP
+  LOCKED` → `XADD` → `SET published_at=now()`. Double-publish is safe because
+  the consumer is idempotent (see below).
 
 ### Processing semantics (A1 worker)
 
 - Consumer group `event-workers`, `XREADGROUP` + `XAUTOCLAIM` for stale msgs.
-- Retry: attempts++ on failure; `attempts >= 5` → `XADD stream:events:dlq` +
-  row in `events_dlq` + event `status='failed'`. Success → `status='processed'`.
+- **Atomic processing (REQUIRED):** per message, ONE Postgres transaction:
+  `SELECT ... FROM events WHERE id=$1 FOR UPDATE` → if `status='processed'`
+  or `'duplicate'` → COMMIT + XACK + return (idempotent redelivery) →
+  `processor.ProcessTx(ctx, tx, evt)` (profile mutation + sends insert, owned
+  by A2) → `UPDATE events SET status='processed', processed_at=now()` →
+  COMMIT → then XACK. Aggregation and completion commit atomically; a crash
+  before ACK is harmless because redelivery sees `status='processed'`.
+- Retry: on error, rollback, `attempts++` in a separate tx; `attempts >= 5` →
+  `status='failed'` + `events_dlq` row + `XADD stream:events:dlq` + XACK.
 - Out-of-order: aggregation is commutative counters; `last_event_*` uses
-  `GREATEST/least` on `occurred_at`; timeline sorts at read time.
-- Per-customer mutation inside a tx with `SELECT ... FOR UPDATE` on the
-  `engagement_profiles` row (serializes concurrent same-customer events).
+  `GREATEST` on `occurred_at`; timeline sorts at read time. Scoring OOO math
+  is specified in §7.
+- Per-customer serialization via `SELECT ... FOR UPDATE` on the
+  `engagement_profiles` row inside the same tx.
+
+### Processor interface (seam between A1 and A2)
+
+```go
+// defined by A1 in internal/events (consumer-defined)
+type Processor interface {
+    ProcessTx(ctx context.Context, tx pgx.Tx, evt StoredEvent) error
+}
+// A2 ships customers.Applier satisfying this; integration wires it in
+// cmd/worker. A1 ships a NoopProcessor stub so the worker compiles/runs alone.
+```
 
 ## 3. Go Interfaces
 
@@ -166,3 +195,57 @@ Inputs required: recency (exponential decay), frequency, conversions,
 positive/negative signals, per-channel engagement. Signature fixed by §3.
 Complexity and reasoning documented in `internal/customers/scoring.go` and
 `docs/SYSTEM_DESIGN.md`.
+
+### Out-of-order-safe score math (REQUIRED semantics)
+
+Model: `score(now) = Σ w_i · exp(-λ·(now − t_i))`. Persist a **raw** decayed
+score plus `score_updated_at` anchor on `engagement_profiles`. For a new event
+at time `t` with weight `w`:
+
+- `t >= anchor`: `raw' = raw · exp(-λ·(t − anchor)) + w`; `anchor = t`
+- `t < anchor` (out-of-order): `raw' = raw + w · exp(-λ·(anchor − t))`;
+  anchor unchanged (older event contributes less — correct decay)
+
+Half-life ≈ 14 days ⇒ `λ = ln2 / 14d`. **Never decay a normalized value:**
+normalization `score/(score+k)` (or tanh) is applied ONLY at read/display
+time. Keep the raw score in the DB. Clamp negative totals at 0.
+
+## 8. AI Workload Isolation (A5)
+
+- Separate `http.Client` w/ per-provider timeout (`cfg.LLMTimeoutMs`).
+- Concurrency semaphore (e.g. 8) capping in-flight LLM calls; excess → 429.
+- Per-provider circuit breaker: open after 3 consecutive failures, half-open
+  after 30s.
+- Response cache keyed `campaign_id + metrics_version + prompt_version`,
+  TTL 5min, Redis `SET ... EX` (survives multi-instance).
+- Stricter rate limit on `/campaigns/*/analyze|recommend` than on `/events`.
+
+## 9. Deployment Topology
+
+- **Production design:** separate `api` and `worker` deployments (compose
+  already does this).
+- **Demo/free-tier mode:** `RUN_EMBEDDED_WORKER=true` starts the worker loop
+  as a goroutine inside the api binary (single Cloud Run/Render service).
+  Worker package must expose `Run(ctx, pool, rdb, cfg, processor)` callable
+  from either binary. Document this trade-off in DEPLOYMENT.md.
+
+## 10. Synthetic Data Corrections (A6)
+
+- `events.event_id` is UNIQUE ⇒ the events table holds **unique ids only**.
+  Duplicates are demonstrated as *repeated ingestion requests*: the seeder
+  also writes `scripts/dupe_batch.json` (~2% of generated payloads repeated)
+  that can be POSTed to `/events` to show `duplicates` counting.
+- Seed `events_dlq` rows directly (invalid payloads) so `/system/dlq` shows
+  data; at least one automated test must drive a real event to the DLQ.
+- Seeded `engagement_profiles` MUST use the §7 formula (raw decayed score),
+  consistent with generated events.
+
+## 11. Observability (all agents)
+
+- Every API router is mounted under middleware `core.RequestID()` +
+  `core.AccessLog()` (wired once in cmd/api at integration).
+- Log `request_id` on errors. Bump `core.Metrics.EventsIngested/Duplicates`
+  in the ingest path.
+- Design doc must name concrete signals: queue depth, oldest pending age,
+  retry/DLQ rate, row-lock wait, LLM latency/invalid-rate/fallback-rate,
+  audience scan counts.
