@@ -2,8 +2,6 @@ package ai
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -18,8 +16,11 @@ import (
 	"github.com/spinach/martech-engine/internal/core"
 )
 
-// cacheTTL is the Redis response-cache lifetime (CONTRACTS §8).
-const cacheTTL = 5 * time.Minute
+// cacheTTL is the Redis response-cache lifetime (CONTRACTS §8). Keyed on
+// campaign+endpoint+objective only — NOT on a metrics hash — so a hit skips
+// the per-campaign metrics scan AND the LLM call. Facts in a cached body are
+// up to cacheTTL stale; an acceptable, documented trade-off.
+const cacheTTL = 60 * time.Second
 
 // Service owns the AI endpoints and the provider chain bulkhead.
 type Service struct {
@@ -72,13 +73,13 @@ type RecommendResponse struct {
 
 func (s *Service) handleAnalyze(c *gin.Context) {
 	ctx := c.Request.Context()
-	facts, factsJSON, ok := s.loadFacts(c, "")
-	if !ok {
-		return
-	}
-	key := cacheKey(c.Param("id"), metricsVersion(factsJSON), "analyze-"+PromptVersion)
+	key := cacheKey(c.Param("id"), "", "analyze-"+PromptVersion)
 	if body, hit := s.cacheGet(ctx, key); hit {
 		c.Data(http.StatusOK, "application/json", body)
+		return
+	}
+	facts, factsJSON, ok := s.loadFacts(c, "")
+	if !ok {
 		return
 	}
 	res, err := s.chain.Execute(ctx, AnalyzePrompt(factsJSON), func(raw string) (any, error) {
@@ -111,13 +112,13 @@ func (s *Service) handleRecommend(c *gin.Context) {
 	if c.Request.Body != nil {
 		_ = c.ShouldBindJSON(&body)
 	}
-	facts, factsJSON, ok := s.loadFacts(c, body.Objective)
-	if !ok {
-		return
-	}
-	key := cacheKey(c.Param("id"), metricsVersion(factsJSON), "recommend-"+PromptVersion)
+	key := cacheKey(c.Param("id"), body.Objective, "recommend-"+PromptVersion)
 	if body2, hit := s.cacheGet(ctx, key); hit {
 		c.Data(http.StatusOK, "application/json", body2)
+		return
+	}
+	facts, factsJSON, ok := s.loadFacts(c, body.Objective)
+	if !ok {
 		return
 	}
 	res, err := s.chain.Execute(ctx, RecommendPrompt(factsJSON), func(raw string) (any, error) {
@@ -214,15 +215,8 @@ func (s *Service) resolveCampaign(ctx context.Context, externalID string) (int64
 	return id, objective, err
 }
 
-// metricsVersion is a short hash of the facts JSON: any metric change (and
-// the embedded objective) yields a new cache key, per CONTRACTS §8.
-func metricsVersion(factsJSON []byte) string {
-	sum := sha256.Sum256(factsJSON)
-	return hex.EncodeToString(sum[:])[:12]
-}
-
-func cacheKey(externalID, metricsVer, promptVer string) string {
-	return "ai:" + externalID + ":" + metricsVer + ":" + promptVer
+func cacheKey(externalID, objective, promptVer string) string {
+	return "ai:" + externalID + ":" + objective + ":" + promptVer
 }
 
 func (s *Service) cacheGet(ctx context.Context, key string) ([]byte, bool) {

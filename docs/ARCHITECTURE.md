@@ -85,9 +85,10 @@ flowchart TB
    │      PostgreSQL 16           │                    │         Redis 7           │
    │  events  (UNIQUE event_id,   │                    │  stream:events            │
    │          status, attempts)   │                    │  stream:events:dlq        │
-   │  event_outbox (published_at) │◄── poll ~5s ──┐    │  AI cache (5 min TTL)     │
-   │  engagement_profiles         │              │    │  post-commit dedup hints  │
-   │  sends · events_dlq          │              │    └───────────▲───────────────┘
+   │  event_outbox (delete-on-    │◄── poll ~5s ──┐    │  AI cache (60 s TTL)      │
+   │    publish) + pending sweeper│              │    │  rate-limit buckets       │
+   │  campaign_metrics (rollup)   │              │    └───────────▲───────────────┘
+   │  sends · events_dlq          │              │                │
    └──────────────▲───────────────┘              │                │
                   │ ONE tx per message:          │                │ XADD
                   │ SELECT event FOR UPDATE      │                │
@@ -96,15 +97,17 @@ flowchart TB
                   │ → status='processed'         │                │
    ┌──────────────┴───────────────────────────┐  │                │
    │        worker × N  (group event-workers) │  │                │
-   │  reconciler ─────────────────────────────┘──┘ (at-least-once)  │
-   │  XREADGROUP (100) + XAUTOCLAIM (idle>30s)                      │
+   │  reconciler + pending sweeper ────────────┘──┘ (at-least-once) │
+   │  XREADGROUP (100) × WORKER_CONCURRENCY goroutines              │
+   │  + XAUTOCLAIM (idle>30s)                                       │
    │  attempts≥5 → events_dlq + XADD stream:events:dlq + XACK       │
    └──────────────────────────────────────────────────────────────┘
 
    AI path (isolated bulkhead):
    /campaigns/{id}/analyze|recommend
         → facts computed in Go (AnalyticsService.Metrics; no PII)
-        → cache (campaign_id+metrics_version+prompt_version, 5 min)
+        → cache (campaign_id+objective+endpoint+prompt_version, 60 s;
+          checked before the metrics query)
         → semaphore 8 (excess → 429)
         → per-provider breaker (3 fails → open; half-open 30 s)
         → groq → gemini → rule-fallback   (always 200; provider +
@@ -116,7 +119,8 @@ flowchart TB
 
 - **Postgres is the system of record**; Redis is transport/cache. Losing
   Redis degrades latency, never correctness — the outbox reconciler
-  republishes anything committed-but-unpublished.
+  republishes anything committed-but-unpublished, and the pending sweeper
+  recovers entries lost after publish.
 - **At-least-once delivery + idempotent consumer**: double-publish is
   expected; the `FOR UPDATE` status check inside the process tx makes
   re-delivery a no-op.

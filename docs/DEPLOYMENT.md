@@ -49,11 +49,14 @@ into `REDIS_URL` (TLS — go-redis handles `rediss://` via `ParseURL`).
 
 - **Eviction caveat — and why it doesn't break correctness.** Free-tier
   Redis is small and may evict under memory pressure. In this system Redis
-  holds (a) stream messages, which are *pointers* to Postgres rows — if a
-  message is evicted, the outbox reconciler republishes the row within
-  ~5 s; (b) AI cache entries — an eviction is just a cache miss; (c)
-  post-commit dedup hints — **advisory only**; the dedup authority is
-  `events.event_id UNIQUE` in Postgres, so eviction can never convert a
+  holds (a) stream messages, which are *pointers* to Postgres rows — if an
+  unpublished one is evicted the outbox reconciler republishes within ~5 s,
+  and if a *published-but-unconsumed* entry is evicted the pending sweeper
+  re-enqueues any `events.status='pending'` row older than 30 s;
+  `stream:events` is also `MAXLEN ~1M` bounded so it can't exhaust memory
+  on its own; (b) AI cache entries — an eviction is just a cache miss; (c)
+  rate-limit buckets — a reset just refills the bucket. The dedup authority
+  is `events.event_id UNIQUE` in Postgres, so eviction can never convert a
   duplicate into an accepted event. Worst case is latency and a cache
   miss, never lost or duplicated data. That property is designed, not
   accidental (SYSTEM_DESIGN.md §5.1, §7.1).
@@ -121,8 +124,11 @@ One **Web Service** from the same Dockerfile:
 | `PORT` | yes (platform sets) | 8080 | Cloud Run/Render inject it |
 | `RUN_EMBEDDED_WORKER` | demo | `false` | `true` for single-service deploys |
 | `WORKER_BATCH_SIZE` | no | 100 | XREADGROUP count |
+| `WORKER_CONCURRENCY` | no | 8 | parallel process-tx goroutines per batch |
 | `WORKER_MAX_ATTEMPTS` | no | 5 | → DLQ after this |
 | `WORKER_CLAIM_IDLE_MS` | no | 30000 | XAUTOCLAIM threshold |
+| `DB_MAX_CONNS` | no | 20 | pgx pool size (size vs Postgres max_connections) |
+| `DB_STATEMENT_TIMEOUT_MS` | no | 10000 | per-query bound — slow scans can't pin conns |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | no | — | absent → rule fallback still serves |
 | `LLM_TIMEOUT_MS` | no | 15000 | per-provider HTTP timeout |
 | `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | no | 500 / 1000 | edge token bucket |

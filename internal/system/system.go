@@ -4,6 +4,7 @@
 package system
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -48,17 +49,22 @@ type healthResponse struct {
 // GET /api/v1/system/health — CONTRACTS §4. 200 when postgres+redis are up,
 // else 503 via core.Unavailable naming the failed dependencies.
 func (h *handlers) health(c *gin.Context) {
-	ctx := c.Request.Context()
+	// Bound the whole check so a hung dependency can't hang the endpoint.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
 
 	pgOK := h.pool.Ping(ctx) == nil
 	redisOK := h.rdb.Ping(ctx).Err() == nil
 
 	var depth, dlqSize int64
 	if redisOK {
+		// Pending (delivered-not-acked) count, not all-time XLEN.
 		depth, _ = h.streams.Depth(ctx)
 	}
 	if pgOK {
-		_ = h.pool.QueryRow(ctx, `SELECT count(*) FROM events_dlq`).Scan(&dlqSize)
+		// Planner estimate — O(1) at any DLQ size, accurate enough for health.
+		_ = h.pool.QueryRow(ctx,
+			`SELECT reltuples::bigint FROM pg_class WHERE relname = 'events_dlq'`).Scan(&dlqSize)
 	}
 
 	if !pgOK || !redisOK {

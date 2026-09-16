@@ -16,13 +16,13 @@ import (
 )
 
 type dlqEntry struct {
-	ID         int64            `json:"id"`
-	EventID    *string          `json:"event_id"`
-	Payload    map[string]any   `json:"payload"`
-	Error      string           `json:"error"`
-	Attempts   int              `json:"attempts"`
-	FailedAt   time.Time        `json:"failed_at"`
-	ReplayedAt *time.Time       `json:"replayed_at"`
+	ID         int64          `json:"id"`
+	EventID    *string        `json:"event_id"`
+	Payload    map[string]any `json:"payload"`
+	Error      string         `json:"error"`
+	Attempts   int            `json:"attempts"`
+	FailedAt   time.Time      `json:"failed_at"`
+	ReplayedAt *time.Time     `json:"replayed_at"`
 }
 
 type dlqPage struct {

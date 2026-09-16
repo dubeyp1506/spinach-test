@@ -151,12 +151,20 @@ durable even if Redis, the XADD, or the process dies immediately after.
 reconciler goroutine (every ~5 s, every worker, SKIP LOCKED so no contention):
   SELECT id, event_db_id FROM event_outbox
    WHERE published_at IS NULL ORDER BY id LIMIT n FOR UPDATE SKIP LOCKED
-  → XADD stream:events → UPDATE published_at=now()
-  (covers: crashed-before-XADD, Redis flushed, best-effort publish lost)
+  → XADD stream:events → DELETE the outbox row
+  (covers: crashed-before-XADD, Redis flushed, best-effort publish lost;
+   DELETE keeps the outbox bounded — a published row's only job was to
+   carry the id to the stream)
+
+pending sweeper (same tick): events stuck at status='pending' >30 s
+  are re-enqueued — closes the "published but stream entry lost/evicted"
+  hole (idx_events_status makes the lookup cheap)
 
 consumer loop per worker:
   XREADGROUP group=event-workers count=100 block
   + periodic XAUTOCLAIM for messages idle > WORKER_CLAIM_IDLE_MS (30 s)
+  batch fanned out over WORKER_CONCURRENCY (default 8) goroutines —
+  serial loop capped ~100-150 ev/s; FOR UPDATE makes contention safe
   per message, ONE tx:
     SELECT * FROM events WHERE id=$1 FOR UPDATE
       status ∈ {processed, duplicate} → COMMIT → XACK → done   (redelivery)
@@ -165,6 +173,8 @@ consumer loop per worker:
                                     (counters, channel_counts, GREATEST
                                     last_event_at, decayed score per §6)
                                     + INSERT sends when type='sent'
+                                    + campaign_metrics rollup upsert
+                                    (analytics never scan events)
     UPDATE events SET status='processed', processed_at=now()
   COMMIT → XACK
   on error: ROLLBACK; separate tx attempts++, last_error;
@@ -242,10 +252,12 @@ fight) closes the gap. Best-effort XADD post-commit keeps the common case at
 stream latency; the reconciler is the floor, not the path.
 
 Double-publish is inherent to the design (API publishes *and* reconciler may
-republish after a crash between XADD and `published_at` update). That is
+republish after a crash between XADD and the outbox DELETE). That is
 safe because consumers are idempotent (§5.3). **At-least-once delivery +
 idempotent consumer is strictly easier to get right than exactly-once
-delivery.**
+delivery.** The stream itself is `XADD MAXLEN ~1M` — a bounded pointer
+buffer; Postgres is the durability layer, and the pending sweeper recovers
+entries evicted before consumption.
 
 ### 5.2 Aggregation and status flip are atomic because partial progress is corrupting
 
@@ -395,13 +407,21 @@ the cap beats filling the audience.
 Problem: ranking 50k+ profiles naively is O(N log N) in memory; at 10M
 customers it's a table scan.
 Approach: indexed SQL prefilter (score floor, recency, channel, activity —
-`idx_profiles_score`, `idx_profiles_last_event`) shrinks N before ranking;
-top-K via a **min-heap of size K** — O(N log K) time, O(K) memory, K ≤
+`idx_profiles_score`, `idx_profiles_last_event`, covering
+`idx_profiles_audience`) shrinks N before ranking; the stream is then
+**bounded to `LIMIT min(10·size, 200_000)`** by raw stored score; top-K via
+a **min-heap of size K** — O(pool log K) time, O(K) memory, K ≤
 100k; stream rows from pgx, never materialize the full set.
-Trade-offs: the heap keeps only K rows so per-candidate work is tiny, but
-the prefilter still reads every matching row — at multi-million scale this
-becomes the case for an analytical store (§11); reason strings are
-computed only for survivors, so they're O(K) not O(N).
+Trade-offs: the candidate pool makes top-K *approximate* — Go-side
+objective re-weighting can reorder within the pool, so a true top-K member
+below the 10·size raw-score cut is missed; `meta.candidates_truncated`
+reports when the pool hit the limit. Exact ranking would require scanning
+every matching row — at multi-million scale that is the case for an
+analytical store (§11). `min_score` arrives normalized [0,1) and is
+inverted to raw units (`raw = 10·s/(1−s)`) before the indexed comparison;
+stored scores are anchor-time values so the floor is slightly
+over-inclusive (decay only shrinks raw). Reason strings are computed only
+for survivors — O(K) not O(N).
 
 **9. Invalid payloads at ingest.**
 Problem: one bad item must not fail a 500-event batch; bad data must not
@@ -433,13 +453,17 @@ keys so retries are safe.
 ## 8. Scale plan (10M events/day and beyond)
 
 **Baseline math.** 10M events/day ≈ 116/s average; sized for 10× ≈
-1.2k/s peak. Each ingest tx is two indexed inserts — even at ~5 ms/tx a
-single connection sustains ~200 tx/s, so the pgx pool (`MaxConns=20`)
-carries peak with headroom. Workers: batch 100 per `XREADGROUP`; one process-tx is a
-few indexed writes (~5 ms), so a single worker loop sustains ~200 msg/s —
-~6 workers cover the 1.2k/s peak. Horizontal scaling is `docker compose up
---scale worker=N`, not a code change (consumer groups + `SKIP LOCKED`
-reconcile already assume N).
+1.2k/s peak. Ingest is one tx per ≤500-event batch (2 `ANY` lookups +
+one multi-row insert + one outbox insert ≈ 4 statements), so the pgx pool
+(`DB_MAX_CONNS`, default 20) carries peak with wide headroom — measured
+~50–60 ms per 500-event batch. Workers: batch 100 per `XREADGROUP` fanned
+out over `WORKER_CONCURRENCY` (default 8) goroutines; one process-tx is a
+few indexed writes (~5 ms), so a single worker process sustains ~800–1.2k
+msg/s — 1–2 workers cover the 1.2k/s peak. Horizontal scaling is `docker
+compose up --scale worker=N`, not a code change (consumer groups +
+`SKIP LOCKED` reconcile already assume N). Hot-customer traffic is the
+known serialization boundary: events for one customer serialize on its
+profile row lock by design.
 
 **Storage growth.** ~1 KB/event row incl. payload → ~10 GB/day, ~300
 GB/month on `events`. Plan:
@@ -564,10 +588,17 @@ the load test runs; the approach is committed now.
 | Post-commit XADD adds ingest latency | Best-effort XADD after commit is non-blocking | ingest latency excludes stream publish entirely |
 | Ranking N profiles for top-K audience | Indexed prefilter → min-heap O(N log K), O(K) memory | heap 9.3 ms vs full sort 238 ms on N=1e6, K=1000 (**~25×**, 341 KB vs 112 MB — `bench_test.go`); live `meta.took_ms` = 63 ms over 15,954 prefiltered candidates |
 | Frequency-cap check per candidate = N queries | One batched `GROUP BY` count over `sends` window | exactly 1 extra query per recommend call |
-| Recomputing LLM output per request | Redis cache on `campaign_id+metrics_version+prompt_version`, 5 min | repeat analyze hits cache — 0 provider calls, ~1 ms |
+| Recomputing LLM output per request | Redis cache on `campaign_id+objective+prompt_version`, 60 s TTL — checked *before* the metrics query | repeat analyze hits cache — 0 metrics scans AND 0 provider calls, ~1 ms |
 | LLM calls can exhaust API workers | Semaphore (8) + breaker + fallback chain | provider-down requests still return 200 via rule fallback (verified live, `provider=rule-based-fallback`) |
 | Timeline pagination unstable under late events | Keyset cursor `(occurred_at, id)` on `(customer_id, occurred_at DESC)` | stable pages, no OFFSET scan; index-only lookups |
-| Batch ingest = N round-trips | Single multi-row `INSERT` per batch (≤500) | **~777 events/s** accepted end-to-end on one laptop process (≈67M/day headroom vs 116/s avg target) |
+| Batch ingest = N round-trips | One tx per batch: 2 `ANY($1)` id lookups + one multi-row `INSERT … ON CONFLICT … RETURNING` + one `unnest` outbox insert; XADDs pipelined post-commit | **500-event batch ~50–60 ms** (was ~640 ms serialized per-event — ~10×); ~8–16k events/s single-client serial, ~5× headroom vs 116/s target even throttled to RATE_LIMIT_RPS events/s |
+| Analytics aggregates scanned all events per call | Worker-maintained `campaign_metrics` rollup (per campaign×channel×type×day) updated in the processing tx | `platformBaseline`/`Metrics`/`listCampaigns` are O(rollup rows) — never an events scan |
+| Audience prefilter streamed every matching profile | `LIMIT min(10·size, 200k)` candidate pool + covering index `idx_profiles_audience` | bounded rows per request; `meta.candidates_truncated` flags when the pool cut (approximate top-K — see §7) |
+| Redis stream retained every entry forever | `XADD MAXLEN ~1M` (approx trim); `queue_depth` = XINFO pending, not XLEN | bounded Redis RAM; health metric reports real backlog |
+| Serial worker drained ~100–150 ev/s | `WORKER_CONCURRENCY` goroutines per batch (default 8) | ~8× drain headroom per worker process |
+| Outbox grew ~10M dead rows/day | DELETE on publish (inline + reconciler paths) | steady-state outbox ≈ 0 rows |
+| Slow query could pin a pool conn forever | `statement_timeout` (10 s default) + HTTP server read/write timeouts + health ctx bound | worst-case query lifetime bounded; pool starvation can't cascade silently |
+| Request-level rate limit under-priced 500-event batches | token cost = `len(events)`; 4 MiB `MaxBytesReader` body cap | event rate is the real bounded quantity |
 | Indexed score prefilter vs sequential scan | `idx_profiles_score` + `idx_profiles_last_event` | EXPLAIN ANALYZE: 0.76 ms vs 11.5 ms (**~15×** at 50k customers; gap widens with N) |
 | Decaying score on every read = full-table sweep | Lazy decay at write time + read-time normalization only | score update O(1)/event inside the processing tx |
 

@@ -22,7 +22,7 @@ func NewProcessor() events.Processor {
 type processorAdapter struct{ a *customers.Applier }
 
 func (p *processorAdapter) ProcessTx(ctx context.Context, tx pgx.Tx, evt events.StoredEvent) error {
-	return p.a.ProcessTx(ctx, tx, customers.ApplierEvent{
+	if err := p.a.ProcessTx(ctx, tx, customers.ApplierEvent{
 		EventDBID:  evt.ID,
 		EventID:    evt.EventID,
 		CustomerID: evt.CustomerID,
@@ -31,7 +31,15 @@ func (p *processorAdapter) ProcessTx(ctx context.Context, tx pgx.Tx, evt events.
 		Type:       evt.Type,
 		OccurredAt: evt.OccurredAt,
 		Payload:    evt.Payload,
-	})
+	}); err != nil {
+		return err
+	}
+	// Campaign rollup in the same atomic tx — analytics reads never scan events.
+	var campaignID int64
+	if evt.CampaignID != nil {
+		campaignID = *evt.CampaignID
+	}
+	return campaigns.ApplyEventTx(ctx, tx, campaignID, evt.Type, evt.Channel, evt.OccurredAt)
 }
 
 // NewMetricsProvider adapts campaigns.Service to ai.MetricsProvider

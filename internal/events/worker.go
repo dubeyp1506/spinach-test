@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -27,9 +28,15 @@ const (
 func Run(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client, cfg *config.Config, p Processor) {
 	streams := queue.NewStreams(rdb)
 	group := cfg.WorkerConsumerGroup
-	// Unique consumer name per run: a crashed worker's pending entries are
-	// migrated here by ClaimStale instead of being read by a stale name.
-	consumer := "worker-" + uuid.NewString()[:8]
+	// Stable consumer name per replica process (hostname+pid): on pod-style
+	// deploys the replacement process reuses the name, so a crashed worker
+	// doesn't leak a dead consumer into the group on every restart. Its stale
+	// pending entries are migrated by ClaimStale regardless.
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "worker"
+	}
+	consumer := host + "-" + strconv.Itoa(os.Getpid())
 
 	slog.Info("event worker starting", "group", group, "consumer", consumer)
 
@@ -43,7 +50,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client, cfg *config
 	slog.Info("event worker stopped")
 }
 
-// consumeLoop XREADGROUPs new messages and processes each in its own tx.
+// consumeLoop XREADGROUPs batches of new messages and processes each batch
+// with a bounded fan-out of cfg.WorkerConcurrency goroutines. processMessage
+// is concurrency-safe: every event is its own tx with SELECT ... FOR UPDATE,
+// so contending workers serialize on the row lock and the loser sees a
+// terminal status.
 func consumeLoop(ctx context.Context, pool *pgxpool.Pool, streams *queue.Streams, cfg *config.Config, group, consumer string, p Processor) {
 	for {
 		select {
@@ -60,10 +71,32 @@ func consumeLoop(ctx context.Context, pool *pgxpool.Pool, streams *queue.Streams
 			sleepCtx(ctx, retryPause)
 			continue
 		}
+		processBatch(ctx, pool, streams, group, p, msgs, cfg)
+	}
+}
+
+// processBatch runs processMessage over one batch with up to
+// cfg.WorkerConcurrency goroutines (semaphore + WaitGroup). Concurrency <= 1
+// keeps the old serial behavior.
+func processBatch(ctx context.Context, pool *pgxpool.Pool, streams *queue.Streams, group string, p Processor, msgs []queue.Message, cfg *config.Config) {
+	if cfg.WorkerConcurrency <= 1 {
 		for _, m := range msgs {
 			processMessage(ctx, pool, streams, group, p, m, cfg)
 		}
+		return
 	}
+	sem := make(chan struct{}, cfg.WorkerConcurrency)
+	var wg sync.WaitGroup
+	for _, m := range msgs {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(m queue.Message) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			processMessage(ctx, pool, streams, group, p, m, cfg)
+		}(m)
+	}
+	wg.Wait()
 }
 
 // claimLoop XAUTOCLAIMs messages idle longer than cfg.WorkerClaimIdleMs
@@ -91,9 +124,7 @@ func claimLoop(ctx context.Context, pool *pgxpool.Pool, streams *queue.Streams, 
 			slog.Error("worker claim", "err", err)
 			continue
 		}
-		for _, m := range msgs {
-			processMessage(ctx, pool, streams, group, p, m, cfg)
-		}
+		processBatch(ctx, pool, streams, group, p, msgs, cfg)
 	}
 }
 
@@ -213,9 +244,11 @@ func recordFailure(ctx context.Context, pool *pgxpool.Pool, streams *queue.Strea
 	}
 }
 
-// reconcileLoop is the outbox publisher (CONTRACTS §2): every 5s it publishes
-// event_outbox rows whose handler-side XADD never happened or was lost, then
-// stamps published_at. Double-publish is safe — consumers are idempotent.
+// reconcileLoop is the outbox publisher + pending sweeper (CONTRACTS §2):
+// every 5s it publishes event_outbox rows whose handler-side XADD never
+// happened (deleting them on success), then re-enqueues events stranded at
+// status='pending' by a lost/evicted stream entry. Double-publish is safe —
+// consumers are idempotent.
 func reconcileLoop(ctx context.Context, pool *pgxpool.Pool, streams *queue.Streams) {
 	tick := time.NewTicker(reconcileInterval)
 	defer tick.Stop()
@@ -230,6 +263,12 @@ func reconcileLoop(ctx context.Context, pool *pgxpool.Pool, streams *queue.Strea
 				return
 			}
 			slog.Error("outbox reconcile", "err", err)
+		}
+		if err := sweepPendingOnce(ctx, pool, streams); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("pending sweep", "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -279,8 +318,12 @@ func reconcileOnce(ctx context.Context, pool *pgxpool.Pool, streams *queue.Strea
 		return tx.Commit(ctx)
 	}
 
-	// XADD outside the tx's query stream; rows that fail stay unpublished and
-	// are retried next cycle.
+	// XADD outside the tx's query stream. The outbox row's only job is to
+	// carry the id to the stream, so once the XADD lands the terminal action
+	// is DELETE — stamping published_at would leave millions of dead rows
+	// per day. The rows stay locked FOR UPDATE until COMMIT, so a crash or
+	// commit failure rolls back the delete and the row is republished next
+	// cycle (consumers are idempotent). Failed XADDs keep their rows.
 	published := make([]int64, 0, len(pending))
 	for _, r := range pending {
 		if err := streams.Enqueue(ctx, queue.EventMessage{
@@ -294,12 +337,51 @@ func reconcileOnce(ctx context.Context, pool *pgxpool.Pool, streams *queue.Strea
 	}
 	if len(published) > 0 {
 		if _, err := tx.Exec(ctx,
-			`UPDATE event_outbox SET published_at = now() WHERE id = ANY($1)`, published,
+			`DELETE FROM event_outbox WHERE id = ANY($1)`, published,
 		); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// sweepPendingOnce is the recovery net for the "published but lost" hole:
+// if a stream entry is evicted (MAXLEN) or the group/pending state is lost,
+// nothing revisits events stuck at status='pending'. Re-XADD any pending row
+// older than 30s (idx_events_status makes the lookup cheap). No outbox row
+// is written — the outbox's job ended at publish — and lock-then-check in
+// processMessage makes duplicate deliveries harmless.
+func sweepPendingOnce(ctx context.Context, pool *pgxpool.Pool, streams *queue.Streams) error {
+	rows, err := pool.Query(ctx, `
+		SELECT id, event_id
+		FROM events
+		WHERE status = 'pending'
+		  AND received_at < now() - interval '30 seconds'
+		ORDER BY id
+		LIMIT $1`, outboxBatch)
+	if err != nil {
+		return err
+	}
+	var stranded []queue.EventMessage
+	for rows.Next() {
+		var m queue.EventMessage
+		if err := rows.Scan(&m.EventDBID, &m.EventID); err != nil {
+			rows.Close()
+			return err
+		}
+		stranded = append(stranded, m)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, m := range stranded {
+		if err := streams.Enqueue(ctx, m); err != nil {
+			slog.Error("sweep xadd", "event_db_id", m.EventDBID, "err", err)
+			continue // row stays pending → retried next cycle
+		}
+	}
+	return nil
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

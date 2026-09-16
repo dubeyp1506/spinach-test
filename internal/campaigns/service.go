@@ -65,15 +65,21 @@ func New(pool *pgxpool.Pool, cfg *config.Config) *Service {
 }
 
 // Metrics implements campaigns.AnalyticsService (CONTRACTS §3).
-// Single GROUP BY query over events; the channel×type pivot happens in Go —
-// no N+1. A campaignID with no events yields a zero-valued struct, not an error.
+// Single GROUP BY query over the worker-maintained campaign_metrics rollup
+// (migration 000003) — O(rollup rows), never a scan of the forever-growing
+// events table. The channel×type pivot happens in Go — no N+1. A campaignID
+// with no events yields a zero-valued struct, not an error.
+//
+// first_event_at/last_event_at are derived from MIN/MAX(day), so they are
+// day-granular (00:00:00 UTC of the first/last active day), not exact
+// event timestamps — the rollup stores no finer time.
 func (s *Service) Metrics(ctx context.Context, campaignID int64) (*CampaignMetrics, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT channel, type, COUNT(*) AS n,
-		       MIN(occurred_at) AS first_at, MAX(occurred_at) AS last_at
-		FROM events
+		SELECT channel, event_type, SUM(count)::bigint AS n,
+		       MIN(day) AS first_day, MAX(day) AS last_day
+		FROM campaign_metrics
 		WHERE campaign_id = $1
-		GROUP BY channel, type`, campaignID)
+		GROUP BY channel, event_type`, campaignID)
 	if err != nil {
 		return nil, err
 	}

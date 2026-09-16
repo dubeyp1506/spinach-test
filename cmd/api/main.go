@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/spinach/martech-engine/internal/ai"
@@ -29,11 +32,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	if err := store.RunMigrations(cfg.DatabaseURL); err != nil {
 		slog.Warn("migrations", "err", err)
 	}
-	pool, err := store.NewPool(ctx, cfg.DatabaseURL)
+	pool, err := store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBStatementTimeoutMs)
 	if err != nil {
 		slog.Error("postgres", "err", err)
 		os.Exit(1)
@@ -56,7 +61,7 @@ func main() {
 	v1 := r.Group("/api/v1")
 	events.NewService(pool, rdb, cfg).RegisterRoutes(v1)
 	customers.New(pool, cfg).RegisterRoutes(v1)
-	audience.New(pool, cfg).RegisterRoutes(v1)
+	audience.New(pool, rdb, cfg).RegisterRoutes(v1)
 	campaignsSvc := campaigns.New(pool, cfg)
 	campaignsSvc.RegisterRoutes(v1)
 	ai.New(pool, rdb, cfg, wire.NewMetricsProvider(campaignsSvc)).RegisterRoutes(v1)
@@ -73,9 +78,28 @@ func main() {
 	r.StaticFS("/app", http.FS(web.FS))
 	r.GET("/", func(c *gin.Context) { c.Redirect(http.StatusFound, "/app/") })
 
-	slog.Info("api listening", "port", cfg.Port)
-	if err := r.Run(fmt.Sprintf(":%d", cfg.Port)); err != nil {
-		slog.Error("server", "err", err)
-		os.Exit(1)
+	// Bounded server: slowloris + runaway-request protection, graceful drain
+	// on SIGTERM so deploys don't kill in-flight batches.
+	srv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	go func() {
+		slog.Info("api listening", "port", cfg.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("shutdown", "err", err)
 	}
 }

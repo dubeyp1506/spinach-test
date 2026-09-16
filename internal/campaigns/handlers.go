@@ -39,7 +39,8 @@ type campaignSummary struct {
 
 // GET /api/v1/campaigns — CONTRACTS §4. Cursor-paginated (cursor = internal
 // campaign id) with ?status= and ?channel= filters. One LEFT JOIN + GROUP BY
-// aggregate for summary metrics — no N+1.
+// over the campaign_metrics rollup for summary metrics — no N+1, and no
+// per-page scan of the events table.
 func (s *Service) listCampaigns(c *gin.Context) {
 	page := core.ParsePage(c)
 
@@ -65,12 +66,12 @@ func (s *Service) listCampaigns(c *gin.Context) {
 
 	rows, err := s.pool.Query(c.Request.Context(), `
 		SELECT c.id, c.external_id, c.name, c.objective, c.channel, c.status, c.started_at,
-		       COUNT(e.id) FILTER (WHERE e.type = 'sent')      AS sends,
-		       COUNT(e.id) FILTER (WHERE e.type = 'delivered') AS delivered,
-		       COUNT(e.id) FILTER (WHERE e.type = 'opened')    AS opens,
-		       COUNT(e.id) FILTER (WHERE e.type = 'converted') AS conversions
+		       COALESCE(SUM(m.count) FILTER (WHERE m.event_type = 'sent'), 0)::bigint      AS sends,
+		       COALESCE(SUM(m.count) FILTER (WHERE m.event_type = 'delivered'), 0)::bigint AS delivered,
+		       COALESCE(SUM(m.count) FILTER (WHERE m.event_type = 'opened'), 0)::bigint    AS opens,
+		       COALESCE(SUM(m.count) FILTER (WHERE m.event_type = 'converted'), 0)::bigint AS conversions
 		FROM campaigns c
-		LEFT JOIN events e ON e.campaign_id = c.id
+		LEFT JOIN campaign_metrics m ON m.campaign_id = c.id
 		WHERE c.id > $1
 		  AND ($2::text = '' OR c.status = $2)
 		  AND ($3::text = '' OR c.channel = $3)

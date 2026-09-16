@@ -35,10 +35,17 @@ type Candidate struct {
 
 // Meta reports the selection funnel. FilteredOut counts considered rows that
 // did not make the final cut (below top-K, frequency-capped, or duplicate).
+// CandidatePoolSize is the LIMIT applied to the SQL pre-filter
+// (10·size, capped); CandidatesTruncated is true when the query returned
+// exactly that many rows — the real top-K may extend below rows never seen.
+// ShortfallReason explains an under-filled response; emitted only when set.
 type Meta struct {
-	CandidatesConsidered int   `json:"candidates_considered"`
-	FilteredOut          int   `json:"filtered_out"`
-	TookMs               int64 `json:"took_ms"`
+	CandidatesConsidered int    `json:"candidates_considered"`
+	FilteredOut          int    `json:"filtered_out"`
+	TookMs               int64  `json:"took_ms"`
+	CandidatePoolSize    int    `json:"candidate_pool_size"`
+	CandidatesTruncated  bool   `json:"candidates_truncated"`
+	ShortfallReason      string `json:"shortfall_reason,omitempty"`
 }
 
 type RecommendResponse struct {

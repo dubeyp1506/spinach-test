@@ -27,7 +27,7 @@ func main() {
 	if err := store.RunMigrations(cfg.DatabaseURL); err != nil {
 		slog.Warn("migrations", "err", err)
 	}
-	pool, err := store.NewPool(ctx, cfg.DatabaseURL)
+	pool, err := store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBStatementTimeoutMs)
 	if err != nil {
 		slog.Error("postgres", "err", err)
 		os.Exit(1)

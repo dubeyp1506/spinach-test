@@ -7,9 +7,10 @@
 // start the tests SKIP, keeping CI green on machines without the stack.
 //
 // Env overrides (with dev defaults):
-//   MARTECH_API   default http://localhost:8080/api/v1
-//   DATABASE_URL  default postgres://martech:martech@localhost:5433/martech?sslmode=disable
-//   REDIS_URL     default redis://localhost:6379/0
+//
+//	MARTECH_API   default http://localhost:8080/api/v1
+//	DATABASE_URL  default postgres://martech:martech@localhost:5433/martech?sslmode=disable
+//	REDIS_URL     default redis://localhost:6379/0
 package tests
 
 import (
@@ -210,9 +211,9 @@ type engagement struct {
 }
 
 type customerProfile struct {
-	CustomerID  string     `json:"customer_id"`
-	IsActive    bool       `json:"is_active"`
-	Engagement  engagement `json:"engagement"`
+	CustomerID string     `json:"customer_id"`
+	IsActive   bool       `json:"is_active"`
+	Engagement engagement `json:"engagement"`
 }
 
 func getCustomer(t *testing.T, extID string) customerProfile {

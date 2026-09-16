@@ -6,6 +6,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -15,9 +16,18 @@ import (
 // workers notice shutdown promptly, long enough to avoid busy-polling.
 const readBlock = 5 * time.Second
 
+// streamMaxLen bounds stream:events via approximate MAXLEN trimming on every
+// XADD. The stream is only a pointer buffer — the Postgres event_outbox plus
+// the worker's reconcileLoop are the durability layer (CONTRACTS §2) — so
+// trimming loses nothing correctness-wise.
+const streamMaxLen = 1_000_000
+
 // Streams implements Producer and Consumer on top of Redis Streams.
 type Streams struct {
 	rdb *redis.Client
+	// groups caches consumer groups this instance has already created so we
+	// don't pay an XGROUP CREATE round-trip on every Read/ClaimStale poll.
+	groups sync.Map // group name -> struct{}
 }
 
 func NewStreams(rdb *redis.Client) *Streams {
@@ -29,10 +39,13 @@ var (
 	_ Consumer = (*Streams)(nil)
 )
 
-// Enqueue XADDs the message onto stream:events (CONTRACTS §2).
+// Enqueue XADDs the message onto stream:events (CONTRACTS §2), bounding the
+// stream with approximate MAXLEN so acked entries don't accumulate forever.
 func (s *Streams) Enqueue(ctx context.Context, msg EventMessage) error {
 	return s.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: StreamEvents,
+		MaxLen: streamMaxLen,
+		Approx: true,
 		Values: map[string]any{
 			"event_db_id": msg.EventDBID,
 			"event_id":    msg.EventID,
@@ -40,24 +53,38 @@ func (s *Streams) Enqueue(ctx context.Context, msg EventMessage) error {
 	}).Err()
 }
 
-// Depth returns XLEN of stream:events (approximate pending depth for health).
+// Depth returns the pending count — messages delivered to a consumer group
+// but not yet XACKed — summed across groups via XINFO GROUPS. That is the
+// real backlog; XLEN would report all-time entries retained until trimming.
 func (s *Streams) Depth(ctx context.Context) (int64, error) {
-	return s.rdb.XLen(ctx, StreamEvents).Result()
+	groups, err := s.rdb.XInfoGroups(ctx, StreamEvents).Result()
+	if err != nil {
+		return 0, err
+	}
+	var pending int64
+	for _, g := range groups {
+		pending += g.Pending
+	}
+	return pending, nil
 }
 
-// Read creates the consumer group if needed (XGROUP CREATE ... MKSTREAM,
-// BUSYGROUP ignored), then XREADGROUPs up to n new messages.
+// Read creates the consumer group once (cached per Streams instance; a
+// NOGROUP error triggers one re-create + retry for post-flush recovery),
+// then XREADGROUPs up to n new messages.
 func (s *Streams) Read(ctx context.Context, group, consumer string, n int64) ([]Message, error) {
 	if err := s.ensureGroup(ctx, group); err != nil {
 		return nil, err
 	}
-	streams, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    group,
-		Consumer: consumer,
-		Streams:  []string{StreamEvents, ">"},
-		Count:    n,
-		Block:    readBlock,
-	}).Result()
+	streams, err := s.readGroup(ctx, group, consumer, n)
+	if isNoGroupErr(err) {
+		// The group vanished after we cached it (e.g. Redis flush): drop the
+		// cache entry, re-create once, and retry the read.
+		s.groups.Delete(group)
+		if gerr := s.ensureGroup(ctx, group); gerr != nil {
+			return nil, err
+		}
+		streams, err = s.readGroup(ctx, group, consumer, n)
+	}
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -75,19 +102,20 @@ func (s *Streams) Read(ctx context.Context, group, consumer string, n int64) ([]
 
 // ClaimStale reclaims pending entries idle longer than idleMs via XAUTOCLAIM.
 // Scans from "0-0" each call; acceptable because claimed messages are processed
-// and acked promptly, keeping the pending list small.
+// and acked promptly, keeping the pending list small. Group creation is cached
+// as in Read, with one re-create + retry on NOGROUP.
 func (s *Streams) ClaimStale(ctx context.Context, group, consumer string, idleMs int64, n int64) ([]Message, error) {
 	if err := s.ensureGroup(ctx, group); err != nil {
 		return nil, err
 	}
-	msgs, _, err := s.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-		Stream:   StreamEvents,
-		Group:    group,
-		Consumer: consumer,
-		MinIdle:  time.Duration(idleMs) * time.Millisecond,
-		Start:    "0-0",
-		Count:    n,
-	}).Result()
+	msgs, _, err := s.autoClaim(ctx, group, consumer, idleMs, n)
+	if isNoGroupErr(err) {
+		s.groups.Delete(group)
+		if gerr := s.ensureGroup(ctx, group); gerr != nil {
+			return nil, err
+		}
+		msgs, _, err = s.autoClaim(ctx, group, consumer, idleMs, n)
+	}
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -121,13 +149,47 @@ func (s *Streams) PublishDLQ(ctx context.Context, msg EventMessage, errMsg strin
 	}).Err()
 }
 
+func (s *Streams) readGroup(ctx context.Context, group, consumer string, n int64) ([]redis.XStream, error) {
+	return s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: consumer,
+		Streams:  []string{StreamEvents, ">"},
+		Count:    n,
+		Block:    readBlock,
+	}).Result()
+}
+
+func (s *Streams) autoClaim(ctx context.Context, group, consumer string, idleMs int64, n int64) ([]redis.XMessage, string, error) {
+	return s.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   StreamEvents,
+		Group:    group,
+		Consumer: consumer,
+		MinIdle:  time.Duration(idleMs) * time.Millisecond,
+		Start:    "0-0",
+		Count:    n,
+	}).Result()
+}
+
+// ensureGroup creates the consumer group at most once per Streams instance
+// (BUSYGROUP ignored). Callers clear the cache entry and call again when a
+// NOGROUP error shows the group was lost server-side.
 func (s *Streams) ensureGroup(ctx context.Context, group string) error {
+	if _, ok := s.groups.Load(group); ok {
+		return nil
+	}
 	// Start at "0" so rows enqueued before the group existed are still read.
 	err := s.rdb.XGroupCreateMkStream(ctx, StreamEvents, group, "0").Err()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return err
 	}
+	s.groups.Store(group, struct{}{})
 	return nil
+}
+
+// isNoGroupErr reports a NOGROUP error: the stream or group was dropped
+// server-side (e.g. FLUSHALL) after we cached its creation.
+func isNoGroupErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "NOGROUP")
 }
 
 func toMessage(m redis.XMessage) Message {

@@ -167,6 +167,9 @@ components:
             candidates_considered: {type: integer}
             filtered_out: {type: integer}
             took_ms: {type: integer}
+            candidate_pool_size: {type: integer, description: "SQL LIMIT applied: min(10*size, 200000)"}
+            candidates_truncated: {type: boolean, description: "true when the candidate pool filled — top-K is approximate"}
+            shortfall_reason: {type: string, description: "set only when frequency-cap reserve under-fills the request"}
     AIAnalysisResponse:
       type: object
       properties:

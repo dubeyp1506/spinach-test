@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"time"
 )
 
 // PlatformBaseline holds platform-wide engagement rates computed across all
@@ -41,7 +40,7 @@ func (s *Service) Analytics(ctx context.Context, campaignID int64, status string
 	}
 	var delivered48h int64
 	if status == "active" {
-		delivered48h, err = s.deliveredSince(ctx, campaignID, time.Now().Add(-48*time.Hour))
+		delivered48h, err = s.deliveredLast48h(ctx, campaignID)
 		if err != nil {
 			return nil, err
 		}
@@ -54,9 +53,12 @@ func (s *Service) Analytics(ctx context.Context, campaignID int64, status string
 }
 
 // platformBaseline aggregates event-type totals across ALL campaigns into
-// platform-wide rates. One GROUP BY query.
+// platform-wide rates. One GROUP BY over the campaign_metrics rollup — note
+// the rollup only covers campaign-attributed events (campaign_id IS NULL
+// events have no rollup row), so the baseline is over attributed events.
 func (s *Service) platformBaseline(ctx context.Context) (PlatformBaseline, error) {
-	rows, err := s.pool.Query(ctx, `SELECT type, COUNT(*) FROM events GROUP BY type`)
+	rows, err := s.pool.Query(ctx,
+		`SELECT event_type, SUM(count)::bigint FROM campaign_metrics GROUP BY event_type`)
 	if err != nil {
 		return PlatformBaseline{}, err
 	}
@@ -95,13 +97,14 @@ type dailyCount struct {
 }
 
 // dailyConversions returns per-day conversion counts for a campaign, used for
-// the day-over-day 3σ spike check.
+// the day-over-day 3σ spike check. Reads the campaign_metrics rollup — the
+// day column is already the DATE grain, so no events scan is needed.
 func (s *Service) dailyConversions(ctx context.Context, campaignID int64) ([]dailyCount, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT occurred_at::date::text AS day, COUNT(*) AS n
-		FROM events
-		WHERE campaign_id = $1 AND type = 'converted'
-		GROUP BY occurred_at::date
+		SELECT day::text AS day, SUM(count)::bigint AS n
+		FROM campaign_metrics
+		WHERE campaign_id = $1 AND event_type = 'converted'
+		GROUP BY day
 		ORDER BY day`, campaignID)
 	if err != nil {
 		return nil, err
@@ -119,14 +122,18 @@ func (s *Service) dailyConversions(ctx context.Context, campaignID int64) ([]dai
 	return out, rows.Err()
 }
 
-// deliveredSince counts delivered events for a campaign since a cutoff —
-// feeds the "zero delivered in 48h on active campaign" rule.
-func (s *Service) deliveredSince(ctx context.Context, campaignID int64, since time.Time) (int64, error) {
+// deliveredLast48h counts delivered events for a campaign in the trailing
+// ~48h — feeds the "zero delivered in 48h on active campaign" rule.
+// The rollup stores days, not timestamps, so the window is day-granular:
+// day >= CURRENT_DATE - 2 covers today + the two prior days (~48–72h),
+// which preserves the rule's semantics closely enough.
+func (s *Service) deliveredLast48h(ctx context.Context, campaignID int64) (int64, error) {
 	var n int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM events
-		WHERE campaign_id = $1 AND type = 'delivered' AND occurred_at > $2`,
-		campaignID, since).Scan(&n)
+		SELECT COALESCE(SUM(count), 0)::bigint FROM campaign_metrics
+		WHERE campaign_id = $1 AND event_type = 'delivered'
+		  AND day >= CURRENT_DATE - 2`,
+		campaignID).Scan(&n)
 	return n, err
 }
 

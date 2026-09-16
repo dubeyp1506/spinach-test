@@ -34,32 +34,31 @@ return allowed
 `)
 
 // rateLimit throttles POST /events per client IP using the Redis token bucket
-// sized by cfg.RateLimitRPS/RateLimitBurst (CONTRACTS §2). Fails open if Redis
-// is unreachable — ingestion must not drop events because the limiter broke;
+// sized by cfg.RateLimitRPS/RateLimitBurst (CONTRACTS §2). The cost is the
+// number of events in the batch — a single request carries up to maxBatch
+// events, so charging one token per request would under-price the endpoint
+// ~500x. Returns false after writing the 429. Fails open if Redis is
+// unreachable — ingestion must not drop events because the limiter broke;
 // durability comes from Postgres, not Redis.
-func (s *Service) rateLimit() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		rps, burst := s.cfg.RateLimitRPS, s.cfg.RateLimitBurst
-		if rps <= 0 || burst <= 0 {
-			c.Next()
-			return
-		}
-		key := "ratelimit:events:" + c.ClientIP()
-		allowed, err := tokenBucketScript.Run(
-			c.Request.Context(), s.rdb, []string{key},
-			rps, burst, time.Now().UnixMilli(), 1,
-		).Int()
-		if err != nil {
-			slog.Warn("rate limiter unavailable, failing open",
-				"request_id", c.GetString("request_id"), "err", err)
-			c.Next()
-			return
-		}
-		if allowed == 0 {
-			core.RespondError(c, http.StatusTooManyRequests,
-				"rate_limited", "rate limit exceeded", nil)
-			return
-		}
-		c.Next()
+func (s *Service) rateLimit(c *gin.Context, cost int) bool {
+	rps, burst := s.cfg.RateLimitRPS, s.cfg.RateLimitBurst
+	if rps <= 0 || burst <= 0 || cost <= 0 {
+		return true
 	}
+	key := "ratelimit:events:" + c.ClientIP()
+	allowed, err := tokenBucketScript.Run(
+		c.Request.Context(), s.rdb, []string{key},
+		rps, burst, time.Now().UnixMilli(), cost,
+	).Int()
+	if err != nil {
+		slog.Warn("rate limiter unavailable, failing open",
+			"request_id", c.GetString("request_id"), "err", err)
+		return true
+	}
+	if allowed == 0 {
+		core.RespondError(c, http.StatusTooManyRequests,
+			"rate_limited", "rate limit exceeded", nil)
+		return false
+	}
+	return true
 }

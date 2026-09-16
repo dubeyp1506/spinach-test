@@ -57,15 +57,26 @@ Rules:
   Redis key must not suppress a legitimate retry).
 - **Transactional outbox (REQUIRED):** in the SAME transaction as the events
   insert, `INSERT INTO event_outbox(event_db_id)`. After commit, the handler
-  does a best-effort `XADD stream:events` for low latency (ignore failure).
+  does a best-effort pipelined `XADD stream:events` for low latency, then
+  DELETEs the published outbox rows (their only job was carrying the id).
   A reconciler loop (runs in the worker process) every ~5s:
   `SELECT ... FROM event_outbox WHERE published_at IS NULL FOR UPDATE SKIP
-  LOCKED` → `XADD` → `SET published_at=now()`. Double-publish is safe because
-  the consumer is idempotent (see below).
+  LOCKED` → `XADD` → `DELETE` successful rows. Double-publish is safe because
+  the consumer is idempotent (see below). A pending-events sweeper on the
+  same tick re-enqueues `events.status='pending'` older than 30s — covers
+  stream entries lost/evicted after publish.
+- Batch shape: ONE tx per request — 2 `ANY($1)` external-id lookups + one
+  multi-row `INSERT ... ON CONFLICT (event_id) DO NOTHING RETURNING` + one
+  `unnest` outbox insert. A failed batch tx → **503** (client retries the
+  batch idempotently), never a 202 with everything itemized as rejected.
+- Body cap 4 MiB; rate limit charges **one token per event** (not per
+  request).
 
 ### Processing semantics (A1 worker)
 
 - Consumer group `event-workers`, `XREADGROUP` + `XAUTOCLAIM` for stale msgs.
+  Each read batch is fanned out over `WORKER_CONCURRENCY` goroutines
+  (default 8); row locking makes contention safe.
 - **Atomic processing (REQUIRED):** per message, ONE Postgres transaction:
   `SELECT ... FROM events WHERE id=$1 FOR UPDATE` → if `status='processed'`
   or `'duplicate'` → COMMIT + XACK + return (idempotent redelivery) →
@@ -172,12 +183,22 @@ type LLMProvider interface {
 // Response 200
 {"candidates":[{"customer_id":"cust_00042","score":0.83,"rank":1,
   "reasons":["score=0.83 top-quartile","preferred_channel=email matches","converted 2x in 30d"]}],
- "meta":{"candidates_considered":42103,"filtered_out":7897,"took_ms":14}}
+ "meta":{"candidates_considered":42103,"filtered_out":7897,"took_ms":14,
+  "candidate_pool_size":10000,"candidates_truncated":true,
+  "shortfall_reason":"frequency_cap_exhausted"}}
 ```
 
-Algorithm contract: SQL pre-filter on indexed columns → **min-heap top-K**
-(O(N log K), not O(N log N) sort) → frequency-cap check via `sends` →
-reason generation. Must document complexity in code.
+`meta.candidate_pool_size` = the SQL LIMIT applied (`min(10·size, 200000)`);
+`candidates_truncated` = true when the pool filled (top-K is approximate —
+re-weighting happens in Go); `shortfall_reason` is `omitempty`, set only
+when the frequency-cap reserve under-fills the requested size.
+`min_score` is normalized [0,1) and is inverted to raw stored-score units
+(`raw = k·s/(1−s)`, k=10) before the indexed filter.
+
+Algorithm contract: SQL pre-filter on indexed columns bounded to
+10·size candidates → **min-heap top-K** (O(pool log K), not O(N log N)
+sort) → frequency-cap check via `sends` → reason generation. Endpoint is
+rate-limited per-IP (10/min, burst 20). Must document complexity in code.
 
 ## 6. Conventions
 
@@ -216,8 +237,10 @@ time. Keep the raw score in the DB. Clamp negative totals at 0.
 - Concurrency semaphore (e.g. 8) capping in-flight LLM calls; excess → 429.
 - Per-provider circuit breaker: open after 3 consecutive failures, half-open
   after 30s.
-- Response cache keyed `campaign_id + metrics_version + prompt_version`,
-  TTL 5min, Redis `SET ... EX` (survives multi-instance).
+- Response cache keyed `campaign_id + objective + endpoint + prompt_version`,
+  TTL 60s, Redis `SET ... EX` (survives multi-instance). Checked BEFORE the
+  metrics query — a hit skips both the DB and the provider. Facts in a
+  cached body are up to 60s stale.
 - Stricter rate limit on `/campaigns/*/analyze|recommend` than on `/events`.
 
 ## 9. Deployment Topology

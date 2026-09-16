@@ -73,11 +73,11 @@ func TestAudienceRecommendShape(t *testing.T) {
 func TestAudienceRecommendValidation(t *testing.T) {
 	requireStack(t)
 	for name, req := range map[string]map[string]any{
-		"size zero":       {"objective": "engagement", "channel": "email", "size": 0},
-		"size too big":    {"objective": "engagement", "channel": "email", "size": 100001},
-		"bad objective":   {"objective": "world-domination", "channel": "email", "size": 10},
-		"bad channel":     {"objective": "engagement", "channel": "smoke-signals", "size": 10},
-		"negative min":    {"objective": "engagement", "channel": "email", "size": 10, "conditions": map[string]any{"min_score": -1}},
+		"size zero":     {"objective": "engagement", "channel": "email", "size": 0},
+		"size too big":  {"objective": "engagement", "channel": "email", "size": 100001},
+		"bad objective": {"objective": "world-domination", "channel": "email", "size": 10},
+		"bad channel":   {"objective": "engagement", "channel": "smoke-signals", "size": 10},
+		"negative min":  {"objective": "engagement", "channel": "email", "size": 10, "conditions": map[string]any{"min_score": -1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			status, raw := doJSON(t, http.MethodPost, "/audience/recommend", req)
