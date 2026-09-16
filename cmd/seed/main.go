@@ -86,36 +86,48 @@ func main() {
 		}
 	}
 
-	custIDs, err := insertCustomers(ctx, pool, ds)
+	// Single tx: either the whole dataset lands or nothing does.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		slog.Error("begin tx", "err", err)
+		os.Exit(1)
+	}
+	defer tx.Rollback(ctx) // no-op after Commit
+
+	custIDs, err := insertCustomers(ctx, tx, ds)
 	if err != nil {
 		slog.Error("insert customers", "err", err)
 		os.Exit(1)
 	}
-	campIDs, err := insertCampaigns(ctx, pool, ds)
+	campIDs, err := insertCampaigns(ctx, tx, ds)
 	if err != nil {
 		slog.Error("insert campaigns", "err", err)
 		os.Exit(1)
 	}
-	if err := insertEvents(ctx, pool, ds, custIDs, campIDs); err != nil {
+	if err := insertEvents(ctx, tx, ds, custIDs, campIDs); err != nil {
 		slog.Error("insert events", "err", err)
 		os.Exit(1)
 	}
-	if err := insertSends(ctx, pool, ds, custIDs, campIDs); err != nil {
+	if err := insertSends(ctx, tx, ds, custIDs, campIDs); err != nil {
 		slog.Error("insert sends", "err", err)
 		os.Exit(1)
 	}
-	if err := insertProfiles(ctx, pool, ds, custIDs); err != nil {
+	if err := insertProfiles(ctx, tx, ds, custIDs); err != nil {
 		slog.Error("insert engagement_profiles", "err", err)
 		os.Exit(1)
 	}
-	if err := insertDLQ(ctx, pool, ds); err != nil {
+	if err := insertDLQ(ctx, tx, ds); err != nil {
 		slog.Error("insert events_dlq", "err", err)
 		os.Exit(1)
 	}
 	// Keep customers.last_event_at consistent with the seeded events.
-	if _, err := pool.Exec(ctx, `UPDATE customers c SET last_event_at = p.last_event_at
+	if _, err := tx.Exec(ctx, `UPDATE customers c SET last_event_at = p.last_event_at
 		FROM engagement_profiles p WHERE p.customer_id = c.id`); err != nil {
 		slog.Error("update customers.last_event_at", "err", err)
+		os.Exit(1)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("commit", "err", err)
 		os.Exit(1)
 	}
 
@@ -140,8 +152,8 @@ func main() {
 }
 
 // insertCustomers bulk-loads customers and returns external_id -> BIGINT id.
-func insertCustomers(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset) (map[string]int64, error) {
-	_, err := pool.CopyFrom(ctx, pgx.Identifier{"customers"},
+func insertCustomers(ctx context.Context, tx pgx.Tx, ds *seedgen.Dataset) (map[string]int64, error) {
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"customers"},
 		[]string{"external_id", "email", "attributes", "is_active", "created_at"},
 		pgx.CopyFromSlice(len(ds.Customers), func(i int) ([]any, error) {
 			c := ds.Customers[i]
@@ -154,12 +166,12 @@ func insertCustomers(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Datase
 	if err != nil {
 		return nil, err
 	}
-	return idMap(ctx, pool, "customers")
+	return idMap(ctx, tx, "customers")
 }
 
 // insertCampaigns bulk-loads campaigns and returns external_id -> BIGINT id.
-func insertCampaigns(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset) (map[string]int64, error) {
-	_, err := pool.CopyFrom(ctx, pgx.Identifier{"campaigns"},
+func insertCampaigns(ctx context.Context, tx pgx.Tx, ds *seedgen.Dataset) (map[string]int64, error) {
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"campaigns"},
 		[]string{"external_id", "name", "objective", "channel", "status",
 			"frequency_cap", "frequency_window_hours", "audience_filter", "started_at", "created_at"},
 		pgx.CopyFromSlice(len(ds.Campaigns), func(i int) ([]any, error) {
@@ -178,13 +190,13 @@ func insertCampaigns(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Datase
 	if err != nil {
 		return nil, err
 	}
-	return idMap(ctx, pool, "campaigns")
+	return idMap(ctx, tx, "campaigns")
 }
 
-func insertEvents(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset, custIDs, campIDs map[string]int64) error {
+func insertEvents(ctx context.Context, tx pgx.Tx, ds *seedgen.Dataset, custIDs, campIDs map[string]int64) error {
 	n := len(ds.Events)
-	logEvery := 10000
-	_, err := pool.CopyFrom(ctx, pgx.Identifier{"events"},
+	const logEvery = 10000
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"events"},
 		[]string{"event_id", "customer_id", "campaign_id", "channel", "type",
 			"occurred_at", "received_at", "payload", "status", "attempts",
 			"last_error", "processed_at"},
@@ -216,8 +228,8 @@ func insertEvents(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset, 
 	return err
 }
 
-func insertSends(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset, custIDs, campIDs map[string]int64) error {
-	_, err := pool.CopyFrom(ctx, pgx.Identifier{"sends"},
+func insertSends(ctx context.Context, tx pgx.Tx, ds *seedgen.Dataset, custIDs, campIDs map[string]int64) error {
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"sends"},
 		[]string{"customer_id", "campaign_id", "channel", "sent_at"},
 		pgx.CopyFromSlice(len(ds.Sends), func(i int) ([]any, error) {
 			s := ds.Sends[i]
@@ -227,9 +239,9 @@ func insertSends(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset, c
 	return err
 }
 
-func insertProfiles(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset, custIDs map[string]int64) error {
+func insertProfiles(ctx context.Context, tx pgx.Tx, ds *seedgen.Dataset, custIDs map[string]int64) error {
 	now := time.Now().UTC()
-	_, err := pool.CopyFrom(ctx, pgx.Identifier{"engagement_profiles"},
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"engagement_profiles"},
 		[]string{"customer_id", "total_events", "channel_counts", "positive_events",
 			"negative_events", "conversions", "last_event_at", "last_event_type",
 			"engagement_score", "score_updated_at", "activity_trend",
@@ -260,8 +272,8 @@ func insertProfiles(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset
 	return err
 }
 
-func insertDLQ(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset) error {
-	_, err := pool.CopyFrom(ctx, pgx.Identifier{"events_dlq"},
+func insertDLQ(ctx context.Context, tx pgx.Tx, ds *seedgen.Dataset) error {
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"events_dlq"},
 		[]string{"event_id", "payload", "error", "attempts", "failed_at"},
 		pgx.CopyFromSlice(len(ds.DLQ), func(i int) ([]any, error) {
 			d := ds.DLQ[i]
@@ -278,10 +290,10 @@ func insertDLQ(ctx context.Context, pool *pgxpool.Pool, ds *seedgen.Dataset) err
 	return err
 }
 
-// idMap reads back external_id -> id so generated rows can reference the
-// real BIGINT keys (works whether or not -truncate restarted identity).
-func idMap(ctx context.Context, pool *pgxpool.Pool, table string) (map[string]int64, error) {
-	rows, err := pool.Query(ctx, fmt.Sprintf("SELECT id, external_id FROM %s", pgx.Identifier{table}.Sanitize()))
+// idMap reads back external_id -> id inside the seed tx so generated rows
+// reference real BIGINT keys (works whether or not -truncate ran).
+func idMap(ctx context.Context, tx pgx.Tx, table string) (map[string]int64, error) {
+	rows, err := tx.Query(ctx, fmt.Sprintf("SELECT id, external_id FROM %s", pgx.Identifier{table}.Sanitize()))
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +311,7 @@ func idMap(ctx context.Context, pool *pgxpool.Pool, table string) (map[string]in
 }
 
 func writeDupeFile(path string, b seedgen.DupeBatch) error {
-	if dir := filepath.Dir(path); dir != "" {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}

@@ -11,6 +11,7 @@ package seedgen
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"sort"
@@ -168,6 +169,10 @@ func Generate(cfg Config) *Dataset {
 
 	// Campaign-funnel events.
 	for i := range ds.Customers {
+		if i > 0 && i%10000 == 0 {
+			slog.Info("seedgen progress", "customers", i, "of", len(ds.Customers),
+				"events", len(ds.Events))
+		}
 		for _, s := range planSends(r, ds, roles[i], now) {
 			emitFunnel(r, ds, perCust, i, s, now)
 		}
@@ -314,7 +319,8 @@ func planSends(r *rand.Rand, ds *Dataset, role custRole, now time.Time) []sendRe
 		st := *ds.Campaigns[ci].StartedAt
 		var at time.Time
 		if old {
-			at = st.Add(time.Duration(r.Intn(72)) * time.Hour)
+			// Funnel tails add up to ~96h; keep old sends >=74d old.
+			at = st.Add(time.Duration(r.Intn(48)) * time.Hour)
 		} else {
 			// exponential jitter keeps sends clustered near campaign starts.
 			at = st.Add(time.Duration(r.ExpFloat64() * float64(36*time.Hour)))
@@ -331,7 +337,7 @@ func planSends(r *rand.Rand, ds *Dataset, role custRole, now time.Time) []sendRe
 // requires a campaign that started >=75d ago; returns -1 if none qualify.
 func pickCampaignIndex(r *rand.Rand, ds *Dataset, old bool, now time.Time) int {
 	var eligible []int
-	cutoff := now.Add(-75 * 24 * time.Hour)
+	cutoff := now.Add(-80 * 24 * time.Hour)
 	for i := range ds.Campaigns {
 		c := &ds.Campaigns[i]
 		if c.StartedAt == nil || (old && c.StartedAt.After(cutoff)) {
@@ -423,33 +429,39 @@ func emitOrganic(r *rand.Rand, ds *Dataset, perCust []int, custIdx, n int, now t
 	finishGroup(r, ds, perCust, evts, now)
 }
 
-// finishGroup applies per-group OOO displacement and failure marking, bumps
+// finishGroup applies per-event OOO displacement and failure marking, bumps
 // per-customer event counts, then appends the group in insertion order.
 //
-// Out-of-order (~1% of events, CONTRACTS §10): swap two events inside the
-// group so a later-occurring event is written first — e.g. an 'opened' row
-// written after the later-occurring 'clicked'. This exercises the OOO paths
-// (§7 decay math, GREATEST last_event_*, commutative counters). Marked
-// events also get a late received_at to model delayed arrival.
+// Out-of-order (~1% of events, CONTRACTS §10): each flagged event is swapped
+// to a different slot inside its group, so a later-occurring event is written
+// first — e.g. an 'opened' row written after the later-occurring 'clicked'.
+// Funnel events are generated in occurred_at order, so any swap inverts it.
+// This exercises the OOO paths (§7 decay math, GREATEST last_event_*,
+// commutative counters). Marked events also get a late received_at to model
+// delayed arrival.
 func finishGroup(r *rand.Rand, ds *Dataset, perCust []int, evts []Event, now time.Time) {
-	if len(evts) >= 2 && r.Float64() < 0.012 {
-		i, j := r.Intn(len(evts)), r.Intn(len(evts))
-		for j == i {
-			j = r.Intn(len(evts))
-		}
-		evts[i], evts[j] = evts[j], evts[i]
-		for _, k := range []int{i, j} {
-			evts[k].OutOfOrder = true
-			evts[k].ReceivedAt = clampTime(
-				evts[k].OccurredAt.Add(jitter(r, time.Hour, 48*time.Hour)), now)
+	if len(evts) >= 2 {
+		for i := range evts {
+			if r.Float64() >= 0.01 {
+				continue
+			}
+			j := r.Intn(len(evts))
+			for j == i {
+				j = r.Intn(len(evts))
+			}
+			evts[i], evts[j] = evts[j], evts[i] // evts[i] now sits at slot j
+			evts[j].OutOfOrder = true
+			evts[j].ReceivedAt = clampTime(
+				evts[j].OccurredAt.Add(jitter(r, time.Hour, 48*time.Hour)), now)
 			ds.OutOfOrderCount++
 		}
 	}
 	// ~0.3% of events exhaust retries -> status='failed' (spec: "failed
-	// events"). Failed rows keep their unique event_id but get no sends row
-	// and are excluded from engagement_profiles (never processed).
+	// events"). 'sent' is excluded so every 'sent' event still gets its sends
+	// row; failed rows keep their unique event_id and are excluded from
+	// engagement_profiles (never processed).
 	for k := range evts {
-		if r.Float64() < 0.003 {
+		if evts[k].Type != "sent" && r.Float64() < 0.003 {
 			evts[k].Status = "failed"
 			evts[k].Attempts = 5
 			evts[k].ProcessedAt = nil
@@ -459,7 +471,8 @@ func finishGroup(r *rand.Rand, ds *Dataset, perCust []int, evts []Event, now tim
 			evts[k].LastError = &errText
 			ds.FailedCount++
 		} else {
-			p := evts[k].ReceivedAt.Add(jitter(r, 10*time.Millisecond, 1500*time.Millisecond))
+			p := clampTime(
+				evts[k].ReceivedAt.Add(jitter(r, 10*time.Millisecond, 1500*time.Millisecond)), now)
 			evts[k].ProcessedAt = &p
 		}
 	}
@@ -491,6 +504,9 @@ func buildSends(ds *Dataset) []Send {
 // so /system/dlq shows data. Payloads mirror the POST /events item shape with
 // realistic validation failures matching internal/events/validate.go.
 func genDLQ(r *rand.Rand, ds *Dataset, now time.Time) []DLQRow {
+	if len(ds.Customers) == 0 {
+		return nil
+	}
 	n := int(math.Round(0.005 * float64(len(ds.Events))))
 	if n < 50 {
 		n = 50
@@ -542,6 +558,9 @@ func genDLQ(r *rand.Rand, ds *Dataset, now time.Time) []DLQRow {
 // payloads ~= 2% of a 100k send volume). Posting scripts/dupe_batch.json
 // re-emits these event_ids so ingestion reports them in `duplicates`.
 func genDupes(r *rand.Rand, ds *Dataset) DupeBatch {
+	if len(ds.Events) == 0 {
+		return DupeBatch{}
+	}
 	var sent int
 	for i := range ds.Events {
 		if ds.Events[i].Type == "sent" {

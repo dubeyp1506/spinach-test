@@ -62,11 +62,21 @@ curl -X POST localhost:8080/api/v1/events -H 'content-type: application/json' -d
 ```
 
 Then replay the seeded duplicate batch (~2% repeated `event_id`s) to show
-dedup counting at scale:
+dedup counting at scale. The file holds ~2000 events and the API caps batches
+at 500, so post it in chunks:
 
 ```bash
-curl -X POST localhost:8080/api/v1/events -H 'content-type: application/json' \
-  --data @scripts/dupe_batch.json
+python3 - <<'EOF'
+import json, urllib.request
+evts = json.load(open('scripts/dupe_batch.json'))['events']
+for i in range(0, len(evts), 500):
+    body = json.dumps({'events': evts[i:i+500]}).encode()
+    r = urllib.request.urlopen(urllib.request.Request(
+        'http://localhost:8080/api/v1/events', data=body,
+        headers={'content-type': 'application/json'}))
+    print(json.load(r))
+EOF
+# → {"accepted":0,"duplicates":500,"rejected":[]} ×4
 ```
 
 Postgres `UNIQUE(event_id)` is the only dedup authority — Redis hints are

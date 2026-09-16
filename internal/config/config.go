@@ -36,7 +36,7 @@ func Load() (*Config, error) {
 	c := &Config{
 		Port:                envInt("PORT", 8080),
 		Env:                 envStr("ENV", "development"),
-		DatabaseURL:         envStr("DATABASE_URL", "postgres://martech:martech@localhost:5432/martech?sslmode=disable"),
+		DatabaseURL:         envStr("DATABASE_URL", "postgres://martech:martech@localhost:5433/martech?sslmode=disable"),
 		RedisURL:            envStr("REDIS_URL", "redis://localhost:6379/0"),
 		WorkerConsumerGroup: envStr("WORKER_CONSUMER_GROUP", "event-workers"),
 		WorkerBatchSize:     int64(envInt("WORKER_BATCH_SIZE", 100)),

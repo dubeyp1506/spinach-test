@@ -76,7 +76,7 @@ func (s *Service) handleAnalyze(c *gin.Context) {
 	if !ok {
 		return
 	}
-	key := cacheKey(c.Param("id"), factsJSON, "analyze-"+PromptVersion)
+	key := cacheKey(c.Param("id"), metricsVersion(factsJSON), "analyze-"+PromptVersion)
 	if body, hit := s.cacheGet(ctx, key); hit {
 		c.Data(http.StatusOK, "application/json", body)
 		return
@@ -115,7 +115,7 @@ func (s *Service) handleRecommend(c *gin.Context) {
 	if !ok {
 		return
 	}
-	key := cacheKey(c.Param("id"), factsJSON, "recommend-"+PromptVersion)
+	key := cacheKey(c.Param("id"), metricsVersion(factsJSON), "recommend-"+PromptVersion)
 	if body2, hit := s.cacheGet(ctx, key); hit {
 		c.Data(http.StatusOK, "application/json", body2)
 		return
@@ -175,7 +175,11 @@ func (s *Service) loadFacts(c *gin.Context, objective string) (*Facts, []byte, b
 	var m *Metrics
 	if s.mp != nil {
 		m, err = s.mp.Metrics(ctx, id)
-		if err != nil {
+		switch {
+		case err == nil:
+		case errors.Is(err, core.ErrNotFound):
+			m = nil // zero-event campaign → insufficient-data output below
+		default:
 			slog.Error("ai metrics", "err", err, "request_id", c.GetString("request_id"))
 			core.Internal(c, err)
 			return nil, nil, false

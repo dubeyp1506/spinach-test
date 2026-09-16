@@ -7,7 +7,7 @@ down:
 	docker compose down
 
 migrate:
-	migrate -path migrations -database "$${DATABASE_URL:-postgres://martech:martech@localhost:5432/martech?sslmode=disable}" up
+	migrate -path migrations -database "$${DATABASE_URL:-postgres://martech:martech@localhost:5433/martech?sslmode=disable}" up
 
 seed:
 	go run ./cmd/seed

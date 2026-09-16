@@ -11,6 +11,7 @@ import (
 	"github.com/spinach/martech-engine/internal/events"
 	"github.com/spinach/martech-engine/internal/queue"
 	"github.com/spinach/martech-engine/internal/store"
+	"github.com/spinach/martech-engine/internal/wire"
 )
 
 func main() {
@@ -40,10 +41,9 @@ func main() {
 	}
 	defer rdb.Close()
 
-	// Processor seam (CONTRACTS §2): NoopProcessor runs the pipeline without
-	// profile mutation. Integration swaps in customers.Applier (A2), which
-	// satisfies events.Processor.
+	// Processor seam (CONTRACTS §2): customers.Applier applies profile
+	// mutations inside the worker's transaction (atomic status+aggregate).
 	slog.Info("worker started")
-	events.Run(ctx, pool, rdb, cfg, events.NoopProcessor{})
+	events.Run(ctx, pool, rdb, cfg, wire.NewProcessor())
 	slog.Info("worker stopped")
 }
