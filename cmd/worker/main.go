@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/spinach/martech-engine/internal/config"
+	"github.com/spinach/martech-engine/internal/events"
 	"github.com/spinach/martech-engine/internal/queue"
 	"github.com/spinach/martech-engine/internal/store"
 )
@@ -39,12 +40,10 @@ func main() {
 	}
 	defer rdb.Close()
 
-	// Worker loop is implemented by the ingestion workstream.
-	_ = pool
-	_ = rdb
-	_ = cfg
-
+	// Processor seam (CONTRACTS §2): NoopProcessor runs the pipeline without
+	// profile mutation. Integration swaps in customers.Applier (A2), which
+	// satisfies events.Processor.
 	slog.Info("worker started")
-	<-ctx.Done()
+	events.Run(ctx, pool, rdb, cfg, events.NoopProcessor{})
 	slog.Info("worker stopped")
 }

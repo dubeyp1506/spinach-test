@@ -1,5 +1,132 @@
 <!doctype html>
-<html><head><title>MarTech Engine</title></head>
-<body><h1>MarTech Engine — demo UI placeholder</h1>
-<p>Implemented by the frontend workstream. API docs: /api/v1</p>
-</body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MarTech Engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <h1>MarTech Engine</h1>
+    <nav>
+      <button class="nav active" data-view="ingest">Ingest</button>
+      <button class="nav" data-view="customers">Customers</button>
+      <button class="nav" data-view="campaigns">Campaigns</button>
+      <button class="nav" data-view="audience">Audience</button>
+      <button class="nav" data-view="ai">AI</button>
+      <button class="nav" data-view="system">System</button>
+    </nav>
+    <div class="api-base">
+      <label for="apiBase">API base</label>
+      <input id="apiBase" value="/api/v1" spellcheck="false">
+    </div>
+  </aside>
+
+  <main>
+    <!-- 1. Ingest -->
+    <section id="view-ingest" class="view active">
+      <h2>Ingest Events</h2>
+      <p class="hint">POST /events — async batch (202), idempotent on event_id. Submit the same batch twice to see duplicates.</p>
+      <div class="controls">
+        <button id="ingRandom">Generate random event</button>
+        <button id="ingSubmit" class="primary">Submit batch</button>
+      </div>
+      <textarea id="ingBody" rows="16" spellcheck="false"></textarea>
+      <div class="error"></div>
+      <div id="ingResult"></div>
+    </section>
+
+    <!-- 2. Customers -->
+    <section id="view-customers" class="view">
+      <h2>Customers</h2>
+      <p class="hint">GET /customers/{id} + /customers/{id}/timeline</p>
+      <div class="controls">
+        <input id="custId" value="cust_00001" spellcheck="false">
+        <button id="custLoad" class="primary">Load</button>
+      </div>
+      <div class="error"></div>
+      <div id="custProfile"></div>
+      <h3>Timeline</h3>
+      <div id="custTimeline"></div>
+      <button id="tlMore" class="hidden">Load more</button>
+    </section>
+
+    <!-- 3. Campaigns -->
+    <section id="view-campaigns" class="view">
+      <h2>Campaigns</h2>
+      <p class="hint">GET /campaigns — click a row for GET /campaigns/{id}/analytics</p>
+      <div class="controls">
+        <button id="campLoad" class="primary">Refresh</button>
+      </div>
+      <div class="error"></div>
+      <div id="campList"></div>
+      <button id="campMore" class="hidden">Load more</button>
+      <div id="campAnalytics"></div>
+    </section>
+
+    <!-- 4. Audience -->
+    <section id="view-audience" class="view">
+      <h2>Audience Recommendation</h2>
+      <p class="hint">POST /audience/recommend — ranked top-K</p>
+      <div class="form">
+        <label>Objective
+          <select id="audObjective">
+            <option>conversion</option><option>engagement</option>
+            <option>retention</option><option>reactivation</option>
+            <option>awareness</option>
+          </select>
+        </label>
+        <label>Channel
+          <select id="audChannel">
+            <option>email</option><option>sms</option><option>whatsapp</option>
+            <option>push</option><option>web</option>
+          </select>
+        </label>
+        <label>Size
+          <input id="audSize" type="number" value="100" min="1" max="100000">
+        </label>
+        <label>Min score
+          <input id="audMinScore" type="number" step="0.01" placeholder="optional">
+        </label>
+        <label>Last active &le; days
+          <input id="audDays" type="number" min="0" placeholder="optional">
+        </label>
+        <button id="audSubmit" class="primary">Recommend</button>
+      </div>
+      <div class="error"></div>
+      <div id="audResult"></div>
+    </section>
+
+    <!-- 5. AI -->
+    <section id="view-ai" class="view">
+      <h2>AI Campaign Analysis</h2>
+      <p class="hint">POST /campaigns/{id}/analyze and /campaigns/{id}/recommend</p>
+      <div class="controls">
+        <input id="aiCampId" value="camp_001" spellcheck="false">
+        <button id="aiAnalyze" class="primary">Analyze</button>
+        <button id="aiRecommend">Recommend</button>
+      </div>
+      <div class="error"></div>
+      <div id="aiResult"></div>
+    </section>
+
+    <!-- 6. System -->
+    <section id="view-system" class="view">
+      <h2>System</h2>
+      <p class="hint">GET /system/health + /system/dlq</p>
+      <div class="controls">
+        <button id="sysRefresh" class="primary">Refresh</button>
+      </div>
+      <div class="error"></div>
+      <div id="sysHealth"></div>
+      <h3>Dead-letter queue</h3>
+      <div id="sysDlq"></div>
+      <button id="dlqMore" class="hidden">Load more</button>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
