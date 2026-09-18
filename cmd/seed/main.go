@@ -67,7 +67,16 @@ func main() {
 		"out_of_order", ds.OutOfOrderCount, "failed", ds.FailedCount,
 		"took", time.Since(started).Round(time.Millisecond))
 
-	pool, err := pgxpool.New(ctx, *dsn)
+	// Managed Postgres (Supabase/Neon) enforces statement and idle-tx
+	// timeouts that kill a single-tx COPY over WAN — lift both for the seed.
+	pcfg, err := pgxpool.ParseConfig(*dsn)
+	if err != nil {
+		slog.Error("parse dsn", "err", err)
+		os.Exit(1)
+	}
+	pcfg.ConnConfig.RuntimeParams["statement_timeout"] = "0"
+	pcfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "0"
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		slog.Error("connect postgres", "err", err)
 		os.Exit(1)
@@ -80,7 +89,7 @@ func main() {
 
 	if *truncate {
 		slog.Info("truncating tables")
-		if _, err := pool.Exec(ctx, `TRUNCATE events, events_dlq, engagement_profiles, sends, event_outbox, customers, campaigns RESTART IDENTITY CASCADE`); err != nil {
+		if _, err := pool.Exec(ctx, `TRUNCATE events, events_dlq, engagement_profiles, sends, event_outbox, campaign_metrics, customers, campaigns RESTART IDENTITY CASCADE`); err != nil {
 			slog.Error("truncate", "err", err)
 			os.Exit(1)
 		}
@@ -106,6 +115,16 @@ func main() {
 	}
 	if err := insertEvents(ctx, tx, ds, custIDs, campIDs); err != nil {
 		slog.Error("insert events", "err", err)
+		os.Exit(1)
+	}
+	// Seeded events bypass the worker, so maintain the rollup here too —
+	// analytics reads campaign_metrics, never the events table.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO campaign_metrics (campaign_id, channel, event_type, day, count)
+		SELECT campaign_id, channel, type, occurred_at::date, COUNT(*)
+		FROM events WHERE campaign_id IS NOT NULL
+		GROUP BY 1,2,3,4`); err != nil {
+		slog.Error("backfill campaign_metrics", "err", err)
 		os.Exit(1)
 	}
 	if err := insertSends(ctx, tx, ds, custIDs, campIDs); err != nil {
