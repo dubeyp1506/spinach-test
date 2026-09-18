@@ -21,18 +21,19 @@ flowchart TB
         AIH["AI handlers<br/>analyze · recommend"]
     end
 
-    subgraph PG[("PostgreSQL 16 — system of record")]
+    subgraph PG["PostgreSQL 16 — system of record"]
         EV["events<br/>UNIQUE(event_id) · status · attempts"]
-        OB["event_outbox<br/>partial idx on published_at IS NULL"]
+        OB["event_outbox<br/>delete-on-publish · pending sweeper"]
+        CM["campaign_metrics<br/>rollup — analytics never scan events"]
         PR["engagement_profiles<br/>counters · raw decayed score"]
         SND["sends<br/>frequency-cap source"]
         DQT["events_dlq"]
     end
 
-    subgraph RD[("Redis 7 — transport + caches")]
+    subgraph RD["Redis 7 — transport + caches"]
         ST["stream:events"]
         SDQ["stream:events:dlq"]
-        CACHE["AI response cache (5 min TTL)<br/>post-commit dedup hints"]
+        CACHE["AI response cache (60 s TTL)<br/>rate-limit buckets"]
     end
 
     subgraph WK["worker × N — consumer group 'event-workers'"]
