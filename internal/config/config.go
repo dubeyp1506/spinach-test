@@ -51,7 +51,7 @@ func Load() (*Config, error) {
 		GroqAPIKey:           envStr("GROQ_API_KEY", ""),
 		GroqModel:            envStr("GROQ_MODEL", "llama-3.1-8b-instant"),
 		GeminiAPIKey:         envStr("GEMINI_API_KEY", ""),
-		GeminiModel:          envStr("GEMINI_MODEL", "gemini-1.5-flash"),
+		GeminiModel:          envStr("GEMINI_MODEL", "gemini-3.5-flash-lite"),
 		LLMTimeoutMs:         envInt("LLM_TIMEOUT_MS", 15000),
 		RateLimitRPS:         envInt("RATE_LIMIT_RPS", 500),
 		RateLimitBurst:       envInt("RATE_LIMIT_BURST", 1000),

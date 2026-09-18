@@ -26,7 +26,7 @@ type GeminiProvider struct {
 func NewGeminiProvider(cfg *config.Config) *GeminiProvider {
 	p := &GeminiProvider{
 		client: &http.Client{Timeout: 15 * time.Second},
-		model:  "gemini-1.5-flash",
+		model:  "gemini-3.5-flash-lite",
 	}
 	if cfg != nil {
 		if cfg.LLMTimeoutMs > 0 {

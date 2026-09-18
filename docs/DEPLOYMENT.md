@@ -64,7 +64,7 @@ into `REDIS_URL` (TLS — go-redis handles `rediss://` via `ParseURL`).
   `noeviction` on the free tier (writes start failing at the cap).
 
 **LLM keys.** `GROQ_API_KEY` (primary, `llama-3.1-8b-instant`) and
-`GEMINI_API_KEY` (backup, `gemini-1.5-flash`). Both are optional at boot —
+`GEMINI_API_KEY` (backup, `gemini-3.5-flash-lite`). Both are optional at boot —
 with neither set, `analyze`/`recommend` still return 200 via
 `rule-fallback` (`fallback_used: true`). Free-tier rate limits exist; the
 5-minute response cache + breaker absorb them (AI_DESIGN.md §6).

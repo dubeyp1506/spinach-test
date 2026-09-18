@@ -26,7 +26,7 @@ default `groq`).
 | Stage | What it is | When it serves |
 |---|---|---|
 | `groq` | `llama-3.1-8b-instant` via Groq API | default — fast free tier, low latency |
-| `gemini` | `gemini-1.5-flash` via Gemini API | groq errors, breaker open, or invalid output after retry |
+| `gemini` | `gemini-3.5-flash-lite` via Gemini API | groq errors, breaker open, or invalid output after retry |
 | `rule-fallback` | deterministic Go code — no network | both providers unavailable/failing; **always succeeds** |
 
 Each stage is tried only if the previous one **failed or produced invalid
