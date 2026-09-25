@@ -11,5 +11,7 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=build /app/api /app/worker /app/seed ./
+# store.RunMigrations reads file://migrations relative to WORKDIR on boot.
+COPY --from=build /src/migrations ./migrations
 EXPOSE 8080
 CMD ["/app/api"]
