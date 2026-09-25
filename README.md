@@ -248,5 +248,6 @@ All via env (see `.env.example`): `DATABASE_URL`, `REDIS_URL`,
 
 ## Deploy
 
-Free-tier single-service recipe (Cloud Run or Render + Neon + Upstash):
-**docs/DEPLOYMENT.md**.
+Render: `render.yaml` is a Blueprint — New → Blueprint → this repo creates
+the API, Postgres and Key Value and auto-deploys every push to `main`.
+Other targets (Cloud Run + Neon + Upstash): **docs/DEPLOYMENT.md**.

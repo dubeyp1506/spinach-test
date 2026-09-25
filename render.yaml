@@ -1,0 +1,68 @@
+# Render Blueprint — creates the whole stack from this file
+# (Render dashboard → New → Blueprint → pick this repo).
+#
+# Topology: the free-tier single-service shape from docs/DEPLOYMENT.md §3 —
+# one Docker web service running the API with the event worker embedded,
+# plus managed Postgres 16 and Key Value (Redis-compatible). All three sit
+# in one region and talk over Render's private network.
+#
+# Render watches main and redeploys on every push (auto-deploy). Migrations
+# run on boot; GET /api/v1/system/health reports the live commit as
+# "version".
+
+databases:
+  - name: martech-db
+    databaseName: martech
+    user: martech
+    plan: free
+    region: singapore
+    postgresMajorVersion: "16"
+
+services:
+  - type: keyvalue
+    name: martech-redis
+    plan: free
+    region: singapore
+    # Redis only holds stream pointers, caches and rate-limit buckets;
+    # eviction costs latency, never correctness (SYSTEM_DESIGN.md §5.1).
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: [] # private network only — no public access
+
+  - type: web
+    name: martech-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/system/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: martech-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: martech-redis
+          property: connectionString
+      - key: ENV
+        value: production
+      - key: RUN_EMBEDDED_WORKER
+        value: "true"
+      # Free instances have a fraction of a CPU and Postgres caps
+      # connections — keep the pool and fan-out small.
+      - key: DB_MAX_CONNS
+        value: "8"
+      - key: WORKER_CONCURRENCY
+        value: "4"
+      - key: LOG_LEVEL
+        value: info
+      - key: LOG_FORMAT
+        value: json
+      - key: EVENT_LOG_MODE
+        value: all
+      # Optional: without keys the AI endpoints answer via rule-based fallback.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

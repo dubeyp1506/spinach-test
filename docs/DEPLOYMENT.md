@@ -104,7 +104,17 @@ gcloud run deploy martech \
 
 ## 4. Render — equivalent recipe
 
-One **Web Service** from the same Dockerfile:
+**One-click (Blueprint).** `render.yaml` at the repo root declares the
+whole stack: the Docker web service (embedded worker), Render Postgres 16
+and Render Key Value, with `DATABASE_URL`/`REDIS_URL` wired automatically.
+Render dashboard → **New → Blueprint** → select this repo → Apply. Render
+then auto-deploys every push to `main`; migrations run on boot, and
+`GET /api/v1/system/health` returns the live commit as `version`. To gate
+deploys on GitHub CI, set the service's Auto-Deploy to "After CI checks
+pass". Seed once from a laptop against the database's *external* URL:
+`go run ./cmd/seed -dsn "$RENDER_EXTERNAL_DATABASE_URL" -dupe-file ''`.
+
+**Manual equivalent.** One **Web Service** from the same Dockerfile:
 
 - Build: Docker; start command `/app/api` (the image default).
 - Env: same vars as §3, `RUN_EMBEDDED_WORKER=true`.

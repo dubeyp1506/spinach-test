@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -46,7 +47,14 @@ type healthResponse struct {
 	QueueDepth int64   `json:"queue_depth"`
 	DLQSize    int64   `json:"dlq_size"`
 	UptimeS    float64 `json:"uptime_s"`
+	// Version is the deployed git commit. Render injects RENDER_GIT_COMMIT;
+	// the CD job polls this until it equals the pushed SHA, so "deployed"
+	// means the new code is serving, not just that a deploy was requested.
+	Version string `json:"version,omitempty"`
 }
+
+// version is read once: the commit can't change for a running process.
+var version = os.Getenv("RENDER_GIT_COMMIT")
 
 // GET /api/v1/system/health — CONTRACTS §4. 200 when postgres+redis are up,
 // else 503 via core.Unavailable naming the failed dependencies.
@@ -88,6 +96,7 @@ func (h *handlers) health(c *gin.Context) {
 		QueueDepth: depth,
 		DLQSize:    dlqSize,
 		UptimeS:    time.Since(startedAt).Seconds(),
+		Version:    version,
 	})
 }
 
