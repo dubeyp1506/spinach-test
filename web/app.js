@@ -34,8 +34,8 @@ function dpick(o, keys) {
 
 async function api(path, opts = {}) {
   const res = await fetch(base() + path, {
-    headers: { 'Content-Type': 'application/json' },
     ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
   });
   let body = null;
   try { body = await res.json(); } catch (_) { /* non-JSON error body */ }
@@ -94,7 +94,12 @@ document.querySelectorAll('.nav').forEach(b => b.addEventListener('click', () =>
     v.classList.toggle('active', v.id === 'view-' + b.dataset.view));
   if (b.dataset.view === 'campaigns' && !campLoaded) loadCampaigns();
   if (b.dataset.view === 'system' && !sysLoaded) loadSystem();
+  if (b.dataset.view === 'logs' && !logsLoaded) loadLogs();
 }));
+
+function showView(view) {
+  document.querySelector(`.nav[data-view="${view}"]`).click();
+}
 
 /* ---------- 1. Ingest ---------- */
 
@@ -116,11 +121,19 @@ $('#ingRandom').onclick = () => {
   $('#ingBody').value = JSON.stringify({ events: [randomEvent()] }, null, 2);
 };
 
+let lastIngestRequestId = null;
+
 $('#ingSubmit').onclick = () => busy('ingest', async () => {
   let payload;
   try { payload = JSON.parse($('#ingBody').value); }
   catch (e) { throw new Error('Invalid JSON: ' + e.message); }
-  const r = await api('/events', { method: 'POST', body: JSON.stringify(payload) });
+  // Our own X-Request-ID, so the batch can be traced end to end in Logs.
+  const reqId = 'ui-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+  const r = await api('/events', {
+    method: 'POST', body: JSON.stringify(payload), headers: { 'X-Request-ID': reqId },
+  });
+  lastIngestRequestId = reqId;
+  $('#ingTrace').classList.remove('hidden');
   const rej = r.rejected || [];
   $('#ingResult').innerHTML = `
     <div class="cards">
@@ -132,6 +145,12 @@ $('#ingSubmit').onclick = () => busy('ingest', async () => {
       [`<span class="num">${esc(x.index)}</span>`, esc(x.reason)])) : ''}
     ${jsonBlock(r)}`;
 });
+
+$('#ingTrace').onclick = () => {
+  setLogFilters({ request_id: lastIngestRequestId });
+  showView('logs');
+  loadLogs();
+};
 
 /* ---------- 2. Customers ---------- */
 
@@ -303,6 +322,79 @@ $('#audSubmit').onclick = () => busy('audience', async () => {
     ${jsonBlock(r)}`;
 });
 
+/* ---------- Channel prediction ---------- */
+
+$('#predChannels').innerHTML = '<span class="k">Candidate channels</span>' + CHANNELS.map(c =>
+  `<label class="pick"><input type="checkbox" value="${c}" checked> ${c}</label>`).join('');
+
+$('#predScope').onchange = () => {
+  const s = $('#predScope').value;
+  document.querySelectorAll('.scope-customer').forEach(el => el.classList.toggle('hidden', s !== 'customer'));
+  document.querySelectorAll('.scope-audience').forEach(el => el.classList.toggle('hidden', s !== 'audience'));
+};
+
+const confClass = c => (c === 'high' ? 'ok' : c === 'medium' ? 'warn' : 'bad');
+
+$('#predSubmit').onclick = () => busy('predict', async () => {
+  const body = {
+    objective: $('#predObjective').value,
+    channels: [...document.querySelectorAll('#predChannels input:checked')].map(i => i.value),
+  };
+  if (!body.channels.length) throw new Error('Pick at least one channel');
+  const lookback = parseInt($('#predLookback').value, 10);
+  if (lookback) body.lookback_days = lookback;
+  const scope = $('#predScope').value;
+  if (scope === 'customer') body.customer_id = $('#predCustomer').value.trim();
+  if (scope === 'audience') {
+    body.audience = {};
+    if ($('#predMinScore').value !== '') body.audience.min_score = parseFloat($('#predMinScore').value);
+    if ($('#predDays').value !== '') body.audience.last_active_days = parseInt($('#predDays').value, 10);
+  }
+  renderPrediction(await api('/predictions/channel', { method: 'POST', body: JSON.stringify(body) }));
+});
+
+function renderPrediction(r) {
+  const meta = r.meta || {};
+  const pctCell = v => `<span class="num">${fmtRate(v)}</span>`;
+  const bar = p => `<div class="pbar"><div style="width:${Math.round((p || 0) * 100)}%"></div></div>
+    <span class="num">${((p || 0) * 100).toFixed(1)}%</span>`;
+  const flags = c => [
+    c.low_data ? badge('low data', 'warn') : '',
+    (c.reasons || []).some(x => x.startsWith('high opt-out')) ? badge('opt-out risk', 'bad') : '',
+    (c.reasons || []).some(x => x.startsWith('high bounce')) ? badge('bounce risk', 'bad') : '',
+  ].join(' ');
+  const ev = c => {
+    const e = c.evidence || {};
+    let s = `${fmtNum(e.objective_successes)} / ${fmtNum(e.objective_delivered)} this objective`;
+    if (e.target_delivered !== undefined) {
+      s += `<br>${fmtNum(e.target_successes)} / ${fmtNum(e.target_delivered)} ${r.scope}`;
+    }
+    return `<span class="num small">${s}</span>`;
+  };
+  $('#predResult').innerHTML = `
+    <div class="cards">
+      <div class="card"><div class="k">recommended channel</div><div class="v">${badge(r.recommended_channel, 'accent')}</div></div>
+      <div class="card"><div class="k">confidence</div><div class="v">${badge(r.confidence, confClass(r.confidence))}</div></div>
+      <div class="card"><div class="k">success event</div><div class="v">${badge(r.success_event)}</div></div>
+      <div class="card"><div class="k">scope</div><div class="v">${badge(r.scope)}${r.customer_id ? ' <span class="mono small">' + esc(r.customer_id) + '</span>' : ''}</div></div>
+      ${meta.audience_size !== undefined ? `<div class="card"><div class="k">audience size</div><div class="v num">${fmtNum(meta.audience_size)}</div></div>` : ''}
+    </div>
+    <p class="summary">${esc(r.advice)}</p>
+    ${table(['rank', 'channel', 'predicted rate', '90% range', 'chance best', 'flags', 'evidence (successes / delivered)', 'reasons'],
+      (r.channels || []).map(c => [
+        `<span class="num">${esc(c.rank)}</span>`,
+        badge(c.channel, c.channel === r.recommended_channel ? 'accent' : ''),
+        pctCell(c.predicted_rate),
+        `<span class="num small">${fmtRate(c.interval_90?.[0])} – ${fmtRate(c.interval_90?.[1])}</span>`,
+        bar(c.prob_best),
+        flags(c),
+        ev(c),
+        `<ul class="reasons">${(c.reasons || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>`,
+      ]))}
+    <p class="meta num">model: ${esc(meta.model)} · samples: ${fmtNum(meta.samples)} · lookback: ${fmtNum(meta.lookback_days)}d · took_ms: ${fmtNum(meta.took_ms)}</p>
+    ${jsonBlock(r)}`;
+}
+
 /* ---------- 5. AI ---------- */
 
 const providerBadges = r => `
@@ -341,6 +433,89 @@ $('#aiRecommend').onclick = () => busy('ai', async () => {
     ${jsonBlock(r)}`;
 });
 
+/* ---------- Logs ---------- */
+
+let logsLoaded = false, logCursor = null;
+
+const LOG_FILTERS = {
+  event_id: '#logEvent', customer_id: '#logCustomer', campaign_id: '#logCampaign',
+  request_id: '#logRequest', stage: '#logStage', level: '#logLevel',
+};
+
+function setLogFilters(f) {
+  Object.entries(LOG_FILTERS).forEach(([k, sel]) => { $(sel).value = f[k] || ''; });
+}
+
+function logQuery(cursor) {
+  const q = new URLSearchParams({ limit: '50' });
+  Object.entries(LOG_FILTERS).forEach(([k, sel]) => {
+    const v = $(sel).value.trim();
+    if (v) q.set(k, v);
+  });
+  if (cursor) q.set('cursor', cursor);
+  return '/logs?' + q.toString();
+}
+
+function loadLogs() {
+  logsLoaded = true;
+  return busy('logs', async () => {
+    logCursor = null;
+    renderLogs(await api(logQuery()), true);
+  });
+}
+
+$('#logSearch').onclick = loadLogs;
+$('#logClear').onclick = () => { setLogFilters({}); loadLogs(); };
+$('#logMore').onclick = () => busy('logs', async () => {
+  renderLogs(await api(logQuery(logCursor)), false);
+});
+document.querySelectorAll('#view-logs input').forEach(i =>
+  i.addEventListener('keydown', e => { if (e.key === 'Enter') loadLogs(); }));
+
+const levelClass = l => (l === 'error' ? 'bad' : l === 'warn' ? 'warn' : l === 'info' ? 'ok' : '');
+const stageClass = s => ({ processed: 'ok', ingested: '', duplicate: '', retry: 'warn', dead_lettered: 'bad', replayed: 'accent' }[s] || '');
+
+function renderLogs(r, reset) {
+  const rows = (r.data || []).map(e => {
+    const d = isObj(e.details) ? e.details : {};
+    const detail = d.error
+      ? `<div class="err-cell small">${esc(d.error)}</div>`
+      : Object.keys(d).length
+        ? `<div class="mono small muted">${esc(Object.entries(d).map(([k, v]) => k + '=' + v).join(' '))}</div>` : '';
+    return `<tr>
+      <td class="small">${fmtTime(e.at)}</td>
+      <td>${badge(e.level, levelClass(e.level))}</td>
+      <td>${badge(e.stage, stageClass(e.stage))}</td>
+      <td>${e.event_id ? `<a href="#" class="mono ev-link" data-ev="${esc(e.event_id)}">${esc(e.event_id)}</a>` : '—'}</td>
+      <td class="mono small">${esc(e.customer_id ?? '—')}</td>
+      <td class="mono small">${esc(e.campaign_id ?? '—')}</td>
+      <td class="num">${esc(e.attempt ?? '')}</td>
+      <td>${esc(e.message)}${detail}</td>
+      <td class="mono small">${esc(e.request_id ?? '')}${e.worker ? `<div class="muted">${esc(e.worker)}</div>` : ''}</td>
+    </tr>`;
+  });
+  if (reset || !$('#logTable')) {
+    $('#logResult').innerHTML = `<table id="logTable"><thead><tr>
+      <th>time</th><th>level</th><th>stage</th><th>event_id</th><th>customer</th><th>campaign</th>
+      <th>attempt</th><th>message</th><th>request / worker</th>
+    </tr></thead><tbody></tbody></table>`;
+  }
+  $('#logTable tbody').insertAdjacentHTML('beforeend', rows.join(''));
+  if (reset && !(r.data || []).length) {
+    $('#logResult').innerHTML = '<p class="meta">No log entries match these filters. Ingest an event, or clear the filters. (Logging can be off: EVENT_LOG_MODE=off, or errors-only.)</p>';
+  }
+  logCursor = r.next_cursor || null;
+  $('#logMore').classList.toggle('hidden', !r.has_more);
+}
+
+$('#logResult').addEventListener('click', e => {
+  const a = e.target.closest('a.ev-link');
+  if (!a) return;
+  e.preventDefault();
+  setLogFilters({ event_id: a.dataset.ev });
+  loadLogs();
+});
+
 /* ---------- 6. System ---------- */
 
 let sysLoaded = false, dlqCursor = null;
@@ -372,6 +547,7 @@ function renderHealth(h) {
       <div class="card"><div class="k">redis</div><div class="v">${statusBadge(h.redis)}</div></div>
       <div class="card"><div class="k">queue_depth</div><div class="v num">${fmtNum(h.queue_depth)}</div></div>
       <div class="card"><div class="k">dlq_size</div><div class="v num">${fmtNum(h.dlq_size)}</div></div>
+      ${h.version ? `<div class="card"><div class="k">version</div><div class="v mono small">${esc(h.version.slice(0, 7))}</div></div>` : ''}
     </div>
     ${jsonBlock(h)}`;
 }

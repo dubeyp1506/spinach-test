@@ -15,7 +15,9 @@
       <button class="nav" data-view="customers">Customers</button>
       <button class="nav" data-view="campaigns">Campaigns</button>
       <button class="nav" data-view="audience">Audience</button>
+      <button class="nav" data-view="predict">Channel Prediction</button>
       <button class="nav" data-view="ai">AI</button>
+      <button class="nav" data-view="logs">Logs</button>
       <button class="nav" data-view="system">System</button>
     </nav>
     <div class="api-base">
@@ -36,6 +38,7 @@
       <textarea id="ingBody" rows="16" spellcheck="false"></textarea>
       <div class="error"></div>
       <div id="ingResult"></div>
+      <button id="ingTrace" class="hidden">Trace this batch in Logs &rarr;</button>
     </section>
 
     <!-- 2. Customers -->
@@ -99,6 +102,44 @@
       <div id="audResult"></div>
     </section>
 
+    <!-- Channel prediction -->
+    <section id="view-predict" class="view">
+      <h2>Channel Prediction</h2>
+      <p class="hint">POST /predictions/channel — which channel will work best for an upcoming campaign, from past campaign results (hierarchical Beta-Binomial + Monte Carlo P(best))</p>
+      <div class="form">
+        <label>Objective
+          <select id="predObjective">
+            <option>conversion</option><option>engagement</option>
+            <option>retention</option><option>reactivation</option>
+            <option>awareness</option>
+          </select>
+        </label>
+        <label>Predict for
+          <select id="predScope">
+            <option value="platform">Whole platform</option>
+            <option value="audience">Target audience</option>
+            <option value="customer">One customer</option>
+          </select>
+        </label>
+        <label class="scope-customer hidden">Customer id
+          <input id="predCustomer" value="cust_00042" spellcheck="false">
+        </label>
+        <label class="scope-audience hidden">Min score
+          <input id="predMinScore" type="number" step="0.01" min="0" max="0.99" value="0.2">
+        </label>
+        <label class="scope-audience hidden">Last active &le; days
+          <input id="predDays" type="number" min="0" value="30">
+        </label>
+        <label>Lookback days
+          <input id="predLookback" type="number" min="1" max="365" value="90">
+        </label>
+        <button id="predSubmit" class="primary">Predict</button>
+      </div>
+      <div class="channel-picks" id="predChannels"></div>
+      <div class="error"></div>
+      <div id="predResult"></div>
+    </section>
+
     <!-- 5. AI -->
     <section id="view-ai" class="view">
       <h2>AI Campaign Analysis</h2>
@@ -110,6 +151,36 @@
       </div>
       <div class="error"></div>
       <div id="aiResult"></div>
+    </section>
+
+    <!-- Logs -->
+    <section id="view-logs" class="view">
+      <h2>Event Logs</h2>
+      <p class="hint">GET /logs — every lifecycle step of an event (ingested, duplicate, processed, retry, dead_lettered, replayed), newest first. Click an event_id to see its full history.</p>
+      <div class="form">
+        <label>event_id <input id="logEvent" spellcheck="false" placeholder="any"></label>
+        <label>customer_id <input id="logCustomer" spellcheck="false" placeholder="any"></label>
+        <label>campaign_id <input id="logCampaign" spellcheck="false" placeholder="any"></label>
+        <label>request_id <input id="logRequest" spellcheck="false" placeholder="any"></label>
+        <label>Stage
+          <select id="logStage">
+            <option value="">any</option><option>ingested</option><option>duplicate</option>
+            <option>processed</option><option>retry</option><option>dead_lettered</option>
+            <option>replayed</option>
+          </select>
+        </label>
+        <label>Min level
+          <select id="logLevel">
+            <option value="">any</option><option>info</option>
+            <option>warn</option><option>error</option>
+          </select>
+        </label>
+        <button id="logSearch" class="primary">Search</button>
+        <button id="logClear">Clear filters</button>
+      </div>
+      <div class="error"></div>
+      <div id="logResult"></div>
+      <button id="logMore" class="hidden">Load more</button>
     </section>
 
     <!-- 6. System -->
