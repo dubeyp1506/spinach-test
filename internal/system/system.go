@@ -18,6 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/spinach/martech-engine/internal/config"
 	"github.com/spinach/martech-engine/internal/core"
+	"github.com/spinach/martech-engine/internal/eventlog"
 	"github.com/spinach/martech-engine/internal/queue"
 )
 
@@ -27,11 +28,12 @@ type handlers struct {
 	pool    *pgxpool.Pool
 	rdb     *redis.Client
 	streams *queue.Streams
+	logMode eventlog.Mode
 }
 
 // RegisterRoutes is the registration convention consumed by cmd/api.
 func RegisterRoutes(rg *gin.RouterGroup, pool *pgxpool.Pool, rdb *redis.Client, cfg *config.Config) {
-	h := &handlers{pool: pool, rdb: rdb, streams: queue.NewStreams(rdb)}
+	h := &handlers{pool: pool, rdb: rdb, streams: queue.NewStreams(rdb), logMode: eventlog.Mode(cfg.EventLogMode)}
 	rg.GET("/system/health", h.health)
 	rg.GET("/system/dlq", h.listDLQ)
 	rg.POST("/system/dlq/:id/replay", h.replayDLQ)
@@ -182,11 +184,13 @@ func (h *handlers) replayDLQ(c *gin.Context) {
 		return
 	}
 
-	var eventDBID int64
+	var eventDBID, customerID int64
+	var campaignID *int64
+	var requestID *string
 	if eventID != nil {
 		_ = tx.QueryRow(ctx,
-			`SELECT id FROM events WHERE event_id = $1`, *eventID,
-		).Scan(&eventDBID)
+			`SELECT id, customer_id, campaign_id, request_id FROM events WHERE event_id = $1`, *eventID,
+		).Scan(&eventDBID, &customerID, &campaignID, &requestID)
 	}
 	if eventDBID > 0 {
 		if _, err := tx.Exec(ctx,
@@ -203,6 +207,28 @@ func (h *handlers) replayDLQ(c *gin.Context) {
 		core.Internal(c, err)
 		return
 	}
+	// Operator action → audit row (recorded in "errors" mode too). The
+	// replaying request's id is kept in details; request_id stays the
+	// original ingest id so the whole history of the event shares one key.
+	entry := eventlog.Entry{
+		CustomerID: customerID,
+		Stage:      eventlog.StageReplayed,
+		Level:      eventlog.LevelInfo,
+		Message:    "dead-lettered event replayed by operator",
+		Details:    map[string]any{"dlq_id": dlqID, "replay_request_id": c.GetString("request_id")},
+	}
+	if eventID != nil {
+		entry.EventID = *eventID
+	}
+	if campaignID != nil {
+		entry.CampaignID = *campaignID
+	}
+	if requestID != nil {
+		entry.RequestID = *requestID
+	}
+	if err := eventlog.WriteIsolated(ctx, tx, h.logMode, entry); err != nil {
+		core.Log(ctx).Warn("event log write failed", "err", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		core.Internal(c, err)
 		return
@@ -216,5 +242,6 @@ func (h *handlers) replayDLQ(c *gin.Context) {
 		core.Unavailable(c, "queue")
 		return
 	}
+	core.Log(ctx).Info("dlq entry replayed", "dlq_id", dlqID, "event_db_id", eventDBID)
 	c.JSON(http.StatusOK, gin.H{"replayed": true})
 }

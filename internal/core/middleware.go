@@ -18,34 +18,53 @@ var Metrics struct {
 	Duplicates     atomic.Int64
 }
 
+// maxRequestIDLen bounds a client-supplied X-Request-ID: it is echoed into
+// every log line and stored on events rows, so an unbounded header would be
+// a cheap way to bloat both.
+const maxRequestIDLen = 128
+
 // RequestID attaches a correlation id to every request/response/log line.
+// It also stores a request-scoped logger (request_id pre-attached) on the
+// request context — handlers log via core.Log(ctx).
 func RequestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.GetHeader("X-Request-ID")
-		if id == "" {
+		if id == "" || len(id) > maxRequestIDLen {
 			id = uuid.NewString()
 		}
 		c.Set("request_id", id)
 		c.Header("X-Request-ID", id)
+		c.Request = c.Request.WithContext(
+			WithLogger(c.Request.Context(), slog.Default().With("request_id", id)))
 		c.Next()
 	}
 }
 
 // AccessLog emits one structured line per request with status + latency.
+// Level follows the outcome so LOG_LEVEL=warn keeps only failures:
+// 5xx → error, 4xx → warn, everything else → info.
 func AccessLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
+		status := c.Writer.Status()
 		Metrics.Requests.Add(1)
-		if c.Writer.Status() >= 500 {
+		level := slog.LevelInfo
+		switch {
+		case status >= 500:
 			Metrics.Errors5xx.Add(1)
+			level = slog.LevelError
+		case status >= 400:
+			level = slog.LevelWarn
 		}
-		slog.Info("request",
-			"request_id", c.GetString("request_id"),
+		Log(c.Request.Context()).Log(c.Request.Context(), level, "request",
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
-			"status", c.Writer.Status(),
+			"route", c.FullPath(),
+			"status", status,
 			"latency_ms", time.Since(start).Milliseconds(),
+			"bytes", c.Writer.Size(),
+			"client_ip", c.ClientIP(),
 		)
 	}
 }

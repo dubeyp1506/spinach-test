@@ -27,6 +27,7 @@ type StoredEvent struct {
 	Attempts    int             `json:"attempts"`
 	LastError   *string         `json:"last_error,omitempty"`
 	ProcessedAt *time.Time      `json:"processed_at,omitempty"`
+	RequestID   string          `json:"request_id,omitempty"` // X-Request-ID of the ingest call
 }
 
 // Processor is the A1/A2 seam (CONTRACTS §2): the worker calls ProcessTx

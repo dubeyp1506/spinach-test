@@ -521,6 +521,46 @@ and OTel trace propagation (the middleware seam is already there); alert on
 `oldest_pending_age` and `dlq_size` growth first — they're the two signals
 that mean "events are silently not being processed."
 
+### 9.1 Logging: two layers, one correlation key
+
+**Problem.** An event crosses an HTTP request, a database commit, a Redis
+stream and a worker — possibly a different worker after a reclaim, possibly
+days later after a DLQ replay. "What happened to `evt_123`?" had no answer
+short of grepping several processes, and the worker's log lines had no
+`request_id` at all (it only receives a pointer from the stream).
+
+**Approach.**
+
+1. *Structured stdout logs* (`core.SetupLogging`): JSON lines with
+   `service`, level from `LOG_LEVEL`. `RequestID()` puts a request-scoped
+   logger in the context (`core.Log(ctx)`), so every handler line carries
+   `request_id` without threading it through signatures. The ingest
+   `request_id` is stored on the durable row (`events.request_id`,
+   migration 000005); the worker reads it from the row it locks, so its
+   lines — including after reconciler/sweeper republish or XAUTOCLAIM —
+   share the key. Levels encode severity, not chattiness: per-event success
+   is `debug` (thousands/s would be the log bill), retry `warn`,
+   dead-letter `error`, access lines `error`/`warn` for 5xx/4xx. Client
+   `X-Request-ID` is capped at 128 bytes (it lands on every line and row).
+2. *Queryable event log* (`event_logs`, `GET /logs`): one row per lifecycle
+   step — ingested, duplicate, processed, retry, dead_lettered, replayed —
+   with event, customer, campaign, request id, worker, attempt and error.
+   Written **in the transaction of the step it describes**, inside a
+   savepoint: the log can never claim a step that rolled back, and a failed
+   log insert can never fail the step (logging must not block the data
+   path). Ingest writes a whole batch's rows in one `unnest` INSERT.
+
+**Trade-offs.** `EVENT_LOG_MODE=all` adds ~2 rows (and 5 index entries
+each) per event — the write amplification §8 warns about, on the one
+node that can't scale out. That is why the mode exists: `errors` records
+only retry/dead_lettered/replayed (problems + operator actions, a tiny
+fraction of volume) and is the production setting at scale; `all` is for
+demos and debugging windows. Retention is a batched `DELETE` every ~minute
+(`EVENT_LOG_RETENTION_DAYS`); at high volume the table should be
+partitioned by day and old partitions dropped, and the happy-path trail
+should live in the log pipeline (Loki/BigQuery) rather than the OLTP
+database. The savepoint costs two extra statements per logged step.
+
 ---
 
 ## 10. Security
@@ -617,3 +657,68 @@ the load test runs; the approach is committed now.
   §3 — deliberate free-tier trade-off).
 - LLM analysis quality is bounded by prompt + model; the fallback is a
   template, not a model (AI_DESIGN.md §8).
+
+---
+
+## 14. Channel prediction — "which medium will work best?"
+
+`POST /api/v1/predictions/channel` answers it for an objective at three
+scopes: the whole platform, a target audience (same filters as the
+recommender), or one customer.
+
+**What counts as success.** Objective → success event, per *delivered*
+message: conversion → `converted`, engagement → `clicked`,
+retention/reactivation/awareness → `opened`. Only campaign-attributed events
+count, in a lookback window (default 90 d) — organic web/app activity has
+clicks without deliveries and would push rates past 100%
+(`engagement_profiles.channel_counts` is unusable for this reason).
+
+**Model: hierarchical Beta-Binomial (empirical Bayes).** A rate from 3
+conversions out of 40 deliveries is not the same claim as one from 3,000
+out of 40,000, so each channel's rate is a Beta distribution built in
+layers, each shrinking toward the one above when its own data is thin:
+
+| Layer | Evidence | Prior strength |
+|---|---|---|
+| 0 platform | all channels, all objectives (`campaign_metrics`) | — |
+| 1 channel | this channel on *other* objectives | 100 pseudo-deliveries toward layer 0 |
+| 2 objective | this channel on *this* objective | 50 toward layer 1 |
+| 3 target | the audience's / customer's own campaign responses (`events`) | layer 2 capped at 500 (audience) / 30 (customer) |
+
+The cap in layer 3 is the key choice: without it 100k platform deliveries
+drown a customer's 40 and every customer gets the platform answer; it is
+applied to every channel (even untried ones) so an unknown channel never
+looks more certain than a tried one.
+
+**Decision, not just ranking.** 4,000 Monte Carlo draws per channel give a
+90% credible interval and `prob_best` — P(this channel truly has the
+highest rate). Channels are ranked by expected rate; `confidence` bands on
+the winner's `prob_best` (≥0.90 high, ≥0.65 medium, else low). A low-
+confidence answer says so and recommends an A/B split against the channel
+most likely to beat the leader (often a thin-data channel with a wide
+interval, not rank 2). Opt-out and bounce rates are reported per channel
+and flagged when >2× the *other* channels' rate (leave-one-out, so one bad
+channel can't hide by inflating the average). Every estimate returns its
+raw evidence and reasons. The RNG seed is fixed: same data → same answer.
+
+**Why not ML.** A trained model (logistic regression/GBM on customer ×
+channel features) is the next step, but needs a training pipeline, feature
+store and offline evaluation; with tens of campaigns the Bayesian model is
+better calibrated, fully explainable and has no training step. The
+response shape (`predicted_rate`, `interval_90`, `prob_best`, `reasons`)
+stays the same when the model behind it is swapped.
+
+**Cost and scaling.** Platform scope reads the `campaign_metrics` rollup —
+O(rollup rows), ~2 ms. Customer scope is a bounded range scan on
+`idx_events_customer_time`, ~2 ms. Audience scope joins every audience
+member's campaign events in the window — measured ~65 ms for a 2,556-
+customer audience on the seeded data, but O(audience events): at millions
+of customers it needs a worker-maintained per-customer × channel × type
+daily rollup (the same pattern as `campaign_metrics`), or sampling.
+
+**Limitations (stated).** Assumes the future audience behaves like past
+campaign audiences (no seasonality, creative or send-time effects);
+campaign channels are chosen by marketers, so historical rates carry
+selection bias — an A/B test is the unbiased answer, which is why the
+endpoint recommends one when it can't separate channels. Hyperparameters
+(100/50/500/30) are hand-set, not fitted.

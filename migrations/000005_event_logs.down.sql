@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS event_logs;
+ALTER TABLE events DROP COLUMN IF EXISTS request_id;

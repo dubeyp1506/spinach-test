@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/spinach/martech-engine/internal/config"
 	"github.com/spinach/martech-engine/internal/core"
+	"github.com/spinach/martech-engine/internal/eventlog"
 	"github.com/spinach/martech-engine/internal/queue"
 )
 
@@ -63,7 +64,10 @@ func (s *Service) ingest(c *gin.Context) {
 		return // 429 already written, or fail-open
 	}
 
-	now := time.Now().UTC()
+	ctx := c.Request.Context()
+	log := core.Log(ctx)
+	start := time.Now()
+	now := start.UTC()
 	resp := batchResponse{Rejected: []rejectedItem{}}
 	items := make([]validatedItem, 0, len(req.Events))
 	for i, raw := range req.Events {
@@ -79,8 +83,8 @@ func (s *Service) ingest(c *gin.Context) {
 		items = append(items, validatedItem{index: i, in: in})
 	}
 
-	if err := s.storeBatch(c.Request.Context(), items, &resp); err != nil {
-		slog.Error("ingest batch tx", "request_id", c.GetString("request_id"), "err", err)
+	if err := s.storeBatch(ctx, c.GetString("request_id"), items, &resp); err != nil {
+		log.Error("ingest batch tx failed", "batch_size", len(req.Events), "err", err)
 		core.Unavailable(c, "database")
 		return
 	}
@@ -90,6 +94,18 @@ func (s *Service) ingest(c *gin.Context) {
 
 	core.Metrics.EventsIngested.Add(int64(resp.Accepted))
 	core.Metrics.Duplicates.Add(int64(resp.Duplicates))
+	log.Info("ingest batch",
+		"batch_size", len(req.Events),
+		"accepted", resp.Accepted,
+		"duplicates", resp.Duplicates,
+		"rejected", len(resp.Rejected),
+		"took_ms", time.Since(start).Milliseconds(),
+	)
+	if log.Enabled(ctx, slog.LevelDebug) {
+		for _, r := range resp.Rejected {
+			log.Debug("ingest item rejected", "index", r.Index, "reason", r.Reason)
+		}
+	}
 	c.JSON(http.StatusAccepted, resp)
 }
 
@@ -116,8 +132,10 @@ type resolvedItem struct {
 // multi-row INSERT ... ON CONFLICT (event_id) DO NOTHING RETURNING id,
 // event_id splits accepted from duplicates (Postgres UNIQUE is the ONLY dedup
 // authority), and accepted rows get their event_outbox rows in the same tx.
+// The ingest request_id is stored on every inserted row (events.request_id)
+// and the event_logs rows for the batch are written in the same tx.
 // Any DB error aborts the whole batch — the caller answers 503.
-func (s *Service) storeBatch(ctx context.Context, items []validatedItem, resp *batchResponse) error {
+func (s *Service) storeBatch(ctx context.Context, requestID string, items []validatedItem, resp *batchResponse) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -185,14 +203,14 @@ func (s *Service) storeBatch(ctx context.Context, items []validatedItem, resp *b
 	// repeated event_id inside this batch — and RETURNING hands back only the
 	// rows that actually inserted, keyed by the unique event_id.
 	var sb strings.Builder
-	sb.WriteString(`INSERT INTO events (event_id, customer_id, campaign_id, channel, type, occurred_at, payload) VALUES `)
-	args := pgx.NamedArgs{}
+	sb.WriteString(`INSERT INTO events (event_id, customer_id, campaign_id, channel, type, occurred_at, payload, request_id) VALUES `)
+	args := pgx.NamedArgs{"rid": nilIfEmpty(requestID)}
 	for i, r := range resolved {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
 		k := "r" + strconv.Itoa(i)
-		fmt.Fprintf(&sb, `(@%[1]s_eid, @%[1]s_cid, @%[1]s_camp, @%[1]s_ch, @%[1]s_ty, @%[1]s_occ, @%[1]s_pay::jsonb)`, k)
+		fmt.Fprintf(&sb, `(@%[1]s_eid, @%[1]s_cid, @%[1]s_camp, @%[1]s_ch, @%[1]s_ty, @%[1]s_occ, @%[1]s_pay::jsonb, @rid)`, k)
 		args[k+"_eid"] = r.in.EventID
 		args[k+"_cid"] = r.customerID
 		args[k+"_camp"] = r.campaignID
@@ -227,15 +245,34 @@ func (s *Service) storeBatch(ctx context.Context, items []validatedItem, resp *b
 	// duplicates — identical classification to the old per-item loop.
 	accepted := make([]int64, 0, len(resolved))
 	acceptedEventIDs := make([]string, 0, len(resolved))
+	logs := make([]eventlog.Entry, 0, len(resolved))
 	for _, r := range resolved {
+		entry := eventlog.Entry{
+			EventID:    r.in.EventID,
+			CustomerID: r.customerID,
+			RequestID:  requestID,
+			Level:      eventlog.LevelInfo,
+			Details:    map[string]any{"channel": r.in.Channel, "type": r.in.Type},
+		}
+		if r.campaignID != nil {
+			entry.CampaignID = *r.campaignID
+		}
 		if dbID, ok := inserted[r.in.EventID]; ok {
 			delete(inserted, r.in.EventID)
 			accepted = append(accepted, dbID)
 			acceptedEventIDs = append(acceptedEventIDs, r.in.EventID)
 			resp.Accepted++
+			entry.Stage, entry.Message = eventlog.StageIngested, "event accepted"
 		} else {
 			resp.Duplicates++
+			entry.Stage, entry.Message = eventlog.StageDuplicate, "duplicate event_id ignored"
 		}
+		logs = append(logs, entry)
+	}
+	// Same tx as the insert, so a rolled-back batch leaves no "ingested"
+	// rows; isolated in a savepoint so a log failure can't fail the batch.
+	if err := eventlog.WriteIsolated(ctx, tx, eventlog.Mode(s.cfg.EventLogMode), logs...); err != nil {
+		core.Log(ctx).Warn("event log write failed; batch still committed", "err", err)
 	}
 
 	// Transactional outbox: same tx, one multi-row insert for accepted rows.
@@ -280,7 +317,7 @@ func (s *Service) publishAccepted(ctx context.Context, dbIDs []int64, eventIDs [
 	published := make([]int64, 0, len(cmds))
 	for i, cmd := range cmds {
 		if err := cmd.Err(); err != nil {
-			slog.Warn("ingest xadd", "event_db_id", dbIDs[i], "err", err)
+			core.Log(ctx).Warn("ingest xadd failed; reconciler will republish", "event_db_id", dbIDs[i], "err", err)
 			continue
 		}
 		published = append(published, dbIDs[i])
@@ -292,7 +329,7 @@ func (s *Service) publishAccepted(ctx context.Context, dbIDs []int64, eventIDs [
 		`DELETE FROM event_outbox WHERE event_db_id = ANY($1)`,
 		published,
 	); err != nil {
-		slog.Warn("ingest delete published outbox", "err", err)
+		core.Log(ctx).Warn("ingest delete published outbox", "err", err)
 	}
 }
 
@@ -328,4 +365,11 @@ func keys(m map[string]struct{}) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

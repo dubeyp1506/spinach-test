@@ -42,7 +42,7 @@ curl localhost:8080/api/v1/system/health
 # → {"status":"ok","postgres":"ok","redis":"ok","queue_depth":…,"dlq_size":…}
 ```
 
-## Demo flow — the 5 reviewer steps
+## Demo flow — reviewer steps
 
 Each step exercises a different correctness property.
 
@@ -137,6 +137,48 @@ validation makes invented stats un-serveable — AI_DESIGN.md §4). With no
 API keys, or with Groq down, you get `provider:"rule-fallback"`,
 `fallback_used:true` — a 200, not an error.
 
+**6. Trace one event through its whole life — structured logs + event log.**
+
+```bash
+curl -X POST localhost:8080/api/v1/events -H 'content-type: application/json' \
+  -H 'X-Request-ID: demo-trace-1' -d '{"events":[{"event_id":"evt_trace_1",
+  "customer_id":"cust_00042","campaign_id":"camp_007","channel":"email",
+  "type":"clicked","occurred_at":"2026-09-16T10:30:00Z"}]}'
+
+curl 'localhost:8080/api/v1/logs?event_id=evt_trace_1'     # ingested → processed
+curl 'localhost:8080/api/v1/logs?request_id=demo-trace-1'  # everything that call caused
+curl 'localhost:8080/api/v1/logs?level=warn'               # retries, dead-letters only
+```
+
+stdout is JSON (one object per line) and every line from the ingest call
+*and* from the worker that later processed the event carries
+`request_id=demo-trace-1` — the worker reads it from `events.request_id`, so
+reconciler/sweeper republishes keep it too. `EVENT_LOG_MODE=errors` keeps
+only retry/dead_lettered/replayed rows (the production setting at volume).
+Design: SYSTEM_DESIGN.md §9.1.
+
+**7. Predict the best channel for an upcoming campaign.**
+
+```bash
+# platform-wide, for an objective
+curl -X POST localhost:8080/api/v1/predictions/channel \
+  -H 'content-type: application/json' -d '{"objective":"conversion"}'
+# for a target audience (same filters as the recommender)
+curl -X POST localhost:8080/api/v1/predictions/channel -H 'content-type: application/json' \
+  -d '{"objective":"engagement","audience":{"min_score":0.3,"last_active_days":30}}'
+# for one customer
+curl -X POST localhost:8080/api/v1/predictions/channel -H 'content-type: application/json' \
+  -d '{"objective":"conversion","customer_id":"cust_00042"}'
+# → {recommended_channel, confidence, advice,
+#    channels[{channel, predicted_rate, interval_90, prob_best, evidence, reasons}]}
+```
+
+A hierarchical Beta-Binomial model over past campaign results: each
+channel's success rate is shrunk toward broader evidence when its own data
+is thin, and Monte Carlo draws give `prob_best` — the chance each channel is
+truly the best. Close races come back `confidence:"low"` with A/B-test advice
+instead of a false winner. Design: SYSTEM_DESIGN.md §14.
+
 ## API surface (all under `/api/v1`)
 
 | Method | Path | Purpose |
@@ -152,6 +194,8 @@ API keys, or with Groq down, you get `provider:"rule-fallback"`,
 | GET | `/system/health` | `{status, postgres, redis, queue_depth, dlq_size}` |
 | GET | `/system/dlq` | Failed events, cursor-paginated |
 | POST | `/system/dlq/{id}/replay` | Re-enqueue a dead-lettered event |
+| GET | `/logs` | Event lifecycle log, newest first; `?event_id=&customer_id=&campaign_id=&request_id=&stage=&level=&since=` |
+| POST | `/predictions/channel` | Best channel for an objective — platform, audience or one customer |
 
 Conventions: `external_id` in all paths; `ErrorBody` envelope on errors;
 cursor pagination (`?limit≤200&cursor=`); `X-Request-ID` echoed for
@@ -173,7 +217,9 @@ internal/
   audience     top-K recommender (A3)
   campaigns    metrics service (A4)
   ai           LLM provider chain + bulkhead (A5)
-migrations     SQL schema (000001 init, 000002 event_outbox)
+  eventlog     event lifecycle log (event_logs table) + GET /logs
+  predict      channel prediction (hierarchical Beta-Binomial) + POST /predictions/channel
+migrations     SQL schema (000001 init … 000005 event_logs + events.request_id)
 docs           SYSTEM_DESIGN · AI_DESIGN · ARCHITECTURE · DEPLOYMENT · CONTRACTS · openapi.yaml
 scripts        dupe_batch.json (seeded duplicates demo)
 tests          integration / race / failure / API tests
@@ -196,7 +242,9 @@ All via env (see `.env.example`): `DATABASE_URL`, `REDIS_URL`,
 `WORKER_BATCH_SIZE=100`, `WORKER_MAX_ATTEMPTS=5`,
 `WORKER_CLAIM_IDLE_MS=30000`, `GROQ_API_KEY`/`GEMINI_API_KEY`,
 `LLM_TIMEOUT_MS=15000`, `RATE_LIMIT_RPS=500`/`BURST=1000`,
-`RUN_EMBEDDED_WORKER=false` (single-service demo mode — DEPLOYMENT.md §3).
+`RUN_EMBEDDED_WORKER=false` (single-service demo mode — DEPLOYMENT.md §3),
+`LOG_LEVEL=info` / `LOG_FORMAT=json`, `EVENT_LOG_MODE=all|errors|off`,
+`EVENT_LOG_RETENTION_DAYS=7`.
 
 ## Deploy
 

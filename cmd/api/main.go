@@ -17,7 +17,9 @@ import (
 	"github.com/spinach/martech-engine/internal/config"
 	"github.com/spinach/martech-engine/internal/core"
 	"github.com/spinach/martech-engine/internal/customers"
+	"github.com/spinach/martech-engine/internal/eventlog"
 	"github.com/spinach/martech-engine/internal/events"
+	"github.com/spinach/martech-engine/internal/predict"
 	"github.com/spinach/martech-engine/internal/queue"
 	"github.com/spinach/martech-engine/internal/store"
 	"github.com/spinach/martech-engine/internal/system"
@@ -31,6 +33,7 @@ func main() {
 		slog.Error("config", "err", err)
 		os.Exit(1)
 	}
+	core.SetupLogging("api", cfg.LogLevel, cfg.LogFormat)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -66,6 +69,8 @@ func main() {
 	campaignsSvc.RegisterRoutes(v1)
 	ai.New(pool, rdb, cfg, wire.NewMetricsProvider(campaignsSvc)).RegisterRoutes(v1)
 	system.RegisterRoutes(v1, pool, rdb, cfg)
+	eventlog.RegisterRoutes(v1, pool)
+	predict.New(pool).RegisterRoutes(v1)
 
 	// Demo topology (CONTRACTS §9): run the event worker in-process so a
 	// single free-tier service still processes the queue. Production deploys

@@ -101,6 +101,34 @@ paths:
       responses:
         '200': {description: Replayed}
         '404': {description: Not found}
+  /logs:
+    get:
+      summary: Event lifecycle log (newest first, cursor-paginated)
+      parameters:
+        - {name: event_id, in: query, schema: {type: string}}
+        - {name: customer_id, in: query, schema: {type: string}, description: external_id}
+        - {name: campaign_id, in: query, schema: {type: string}, description: external_id}
+        - {name: request_id, in: query, schema: {type: string}}
+        - {name: stage, in: query, schema: {$ref: '#/components/schemas/LogStage'}}
+        - {name: level, in: query, schema: {type: string, enum: [debug, info, warn, error]}, description: minimum level}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, default: 50, maximum: 200}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: ListResponse<LogEntry>, content: {application/json: {schema: {$ref: '#/components/schemas/LogPage'}}}}
+        '400': {description: Invalid filter}
+  /predictions/channel:
+    post:
+      summary: Predict the best channel for an upcoming campaign (platform, audience or customer)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelPredictionRequest'}
+      responses:
+        '200': {description: Ranked channels, content: {application/json: {schema: {$ref: '#/components/schemas/ChannelPredictionResponse'}}}}
+        '400': {description: Validation failed}
+        '404': {description: Unknown customer}
 components:
   parameters:
     externalId:
@@ -199,3 +227,80 @@ components:
               confidence: {type: number}
         provider: {type: string}
         fallback_used: {type: boolean}
+    LogStage: {type: string, enum: [ingested, duplicate, processed, retry, dead_lettered, replayed]}
+    LogEntry:
+      type: object
+      properties:
+        id: {type: integer}
+        at: {type: string, format: date-time}
+        stage: {$ref: '#/components/schemas/LogStage'}
+        level: {type: string, enum: [debug, info, warn, error]}
+        message: {type: string}
+        event_id: {type: string}
+        customer_id: {type: string, description: external_id}
+        campaign_id: {type: string, description: external_id}
+        request_id: {type: string, description: X-Request-ID of the ingest call}
+        worker: {type: string, description: consumer name of the worker that handled the step}
+        attempt: {type: integer}
+        details: {type: object}
+    LogPage:
+      type: object
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/LogEntry'}}
+        next_cursor: {type: string}
+        has_more: {type: boolean}
+    ChannelPredictionRequest:
+      type: object
+      required: [objective]
+      properties:
+        objective: {type: string, enum: [conversion, engagement, retention, reactivation, awareness]}
+        channels: {type: array, items: {$ref: '#/components/schemas/Channel'}, description: candidates; default all}
+        customer_id: {type: string, description: "scope=customer; exclusive with audience"}
+        audience:
+          type: object
+          description: "scope=audience; exclusive with customer_id"
+          properties:
+            min_score: {type: number, minimum: 0, exclusiveMaximum: 1}
+            last_active_days: {type: integer, minimum: 0}
+        lookback_days: {type: integer, minimum: 1, maximum: 365, default: 90}
+    ChannelPredictionResponse:
+      type: object
+      properties:
+        objective: {type: string}
+        scope: {type: string, enum: [platform, audience, customer]}
+        customer_id: {type: string}
+        success_event: {type: string, enum: [converted, clicked, opened]}
+        recommended_channel: {$ref: '#/components/schemas/Channel'}
+        confidence: {type: string, enum: [high, medium, low]}
+        advice: {type: string}
+        channels:
+          type: array
+          items:
+            type: object
+            properties:
+              rank: {type: integer}
+              channel: {$ref: '#/components/schemas/Channel'}
+              predicted_rate: {type: number, description: posterior mean success rate per delivered}
+              interval_90: {type: array, items: {type: number}, minItems: 2, maxItems: 2}
+              prob_best: {type: number, description: P(this channel has the highest true rate)}
+              low_data: {type: boolean}
+              opt_out_rate: {type: number}
+              bounce_rate: {type: number}
+              evidence:
+                type: object
+                properties:
+                  objective_delivered: {type: integer}
+                  objective_successes: {type: integer}
+                  other_objectives_delivered: {type: integer}
+                  other_objectives_successes: {type: integer}
+                  target_delivered: {type: integer}
+                  target_successes: {type: integer}
+              reasons: {type: array, items: {type: string}}
+        meta:
+          type: object
+          properties:
+            lookback_days: {type: integer}
+            audience_size: {type: integer}
+            model: {type: string}
+            samples: {type: integer}
+            took_ms: {type: integer}

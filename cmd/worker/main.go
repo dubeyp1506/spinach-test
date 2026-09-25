@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/spinach/martech-engine/internal/config"
+	"github.com/spinach/martech-engine/internal/core"
 	"github.com/spinach/martech-engine/internal/events"
 	"github.com/spinach/martech-engine/internal/queue"
 	"github.com/spinach/martech-engine/internal/store"
@@ -20,6 +21,7 @@ func main() {
 		slog.Error("config", "err", err)
 		os.Exit(1)
 	}
+	core.SetupLogging("worker", cfg.LogLevel, cfg.LogFormat)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

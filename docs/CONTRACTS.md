@@ -18,6 +18,8 @@ change, update this file in the same PR that changes the code.
 | A7 Tests | `tests/**` ONLY (integration, race, failure, API tests). Module agents own their own `internal/**/*_test.go` unit tests — A7 never edits them | all |
 | A8 Frontend | `web/**` | openapi.yaml |
 | A9 Docs/DevOps | `docs/SYSTEM_DESIGN.md`, `docs/AI_DESIGN.md`, `README.md`, deploy configs | all |
+| A10 Event log | `internal/eventlog/**` (writer + GET /logs); write calls inside `internal/events` and `internal/system` | core |
+| A11 Prediction | `internal/predict/**` | core, store; reads `campaign_metrics`, `events`, `engagement_profiles` (SQL only, no module imports) |
 
 Shared files (`cmd/api/main.go`, `go.mod`, `migrations/`) — changes only via
 explicit contract update. Router registration happens in `cmd/api/main.go`;
@@ -161,6 +163,8 @@ type LLMProvider interface {
 | GET `/system/health` | A1 | `{status, postgres, redis, queue_depth, dlq_size}` |
 | GET `/system/dlq` | A1 | cursor-paginated DLQ rows |
 | POST `/system/dlq/{id}/replay` | A1 | re-enqueue a DLQ entry (bonus) |
+| GET `/logs` | A10 | event lifecycle log, see §12 |
+| POST `/predictions/channel` | A11 | best channel for an objective, see §13 |
 
 `{id}` path params accept the row's `external_id` (string). Errors use
 `core.ErrorBody`. Lists use `core.ListResponse` cursor pagination.
@@ -272,3 +276,50 @@ time. Keep the raw score in the DB. Clamp negative totals at 0.
 - Design doc must name concrete signals: queue depth, oldest pending age,
   retry/DLQ rate, row-lock wait, LLM latency/invalid-rate/fallback-rate,
   audience scan counts.
+- Logs are JSON lines on stdout (`LOG_FORMAT=json`, default) with a
+  `service` field. Handlers log through `core.Log(ctx)`, which already
+  carries `request_id`; the worker's context logger carries `worker` and,
+  per message, `event_id`, `event_db_id` and the ingest `request_id` (read
+  from `events.request_id`). Levels: per-event success = debug, retry =
+  warn, dead-letter = error, 5xx access lines = error, 4xx = warn.
+
+## 12. Event Log Contract (A10)
+
+- Table `event_logs` (migration 000005). Stages: `ingested`, `duplicate`,
+  `processed`, `retry`, `dead_lettered`, `replayed`; levels `debug|info|warn|error`.
+- Rows are written in the SAME transaction as the step they describe,
+  inside a savepoint (`eventlog.WriteIsolated`): a log row exists only if
+  its step committed, and a failed log insert never fails the step.
+- `EVENT_LOG_MODE`: `all` (every stage), `errors` (retry, dead_lettered,
+  replayed only), `off`. Retention: the worker prunes rows older than
+  `EVENT_LOG_RETENTION_DAYS` in batches of 5,000.
+- `GET /logs` — newest first, `core.ListResponse`, cursor = last row id.
+  Filters (ANDed, all optional): `event_id`, `customer_id` and
+  `campaign_id` (external ids; unknown → empty page), `request_id`,
+  `stage`, `level` (minimum: `warn` returns warn+error), `since` (RFC3339).
+  Bad filter values → 400 `validation_failed`.
+
+## 13. Channel Prediction Contract (A11)
+
+`POST /predictions/channel`
+
+```json
+{"objective":"conversion",                 // required, campaign objective enum
+ "channels":["email","sms"],               // optional, default all five
+ "customer_id":"cust_00042",               // optional → scope "customer"
+ "audience":{"min_score":0.2,"last_active_days":30}, // optional → scope "audience"
+ "lookback_days":90}                       // optional, 1..365, default 90
+```
+
+- `customer_id` and `audience` are mutually exclusive; neither → scope
+  `platform`. Unknown customer → 404. Validation → 400 with field details.
+- Success event per objective: conversion→`converted`, engagement→`clicked`,
+  retention/reactivation/awareness→`opened`; denominator `delivered`.
+- Response: `{objective, scope, success_event, recommended_channel,
+  confidence (high|medium|low), advice, channels[{rank, channel,
+  predicted_rate, interval_90[2], prob_best, low_data, opt_out_rate,
+  bounce_rate, evidence{…}, reasons[]}], meta{lookback_days,
+  audience_size?, model, samples, took_ms}}`.
+- `channels` is ranked by `predicted_rate`; `prob_best` sums to 1;
+  `confidence` bands on the winner's `prob_best` (≥0.90 high, ≥0.65 medium).
+  Same inputs → same output (fixed RNG seed).

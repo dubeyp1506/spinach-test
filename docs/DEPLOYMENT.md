@@ -132,6 +132,10 @@ One **Web Service** from the same Dockerfile:
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | no | — | absent → rule fallback still serves |
 | `LLM_TIMEOUT_MS` | no | 15000 | per-provider HTTP timeout |
 | `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | no | 500 / 1000 | edge token bucket |
+| `LOG_LEVEL` | no | `info` | `debug` adds a line per processed event |
+| `LOG_FORMAT` | no | `json` | `text` for local reading; JSON for Cloud Logging/Loki |
+| `EVENT_LOG_MODE` | no | `all` | `errors` at high volume (only retry/dead_lettered/replayed rows); `off` disables |
+| `EVENT_LOG_RETENTION_DAYS` | no | 7 | worker prunes older `event_logs` rows ~once a minute |
 
 ## 6. Post-deploy checks
 
