@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/spinach/martech-engine/internal/activity"
 	"github.com/spinach/martech-engine/internal/ai"
 	"github.com/spinach/martech-engine/internal/audience"
 	"github.com/spinach/martech-engine/internal/campaigns"
@@ -59,7 +60,25 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
-	r.Use(gin.Recovery(), core.RequestID(), core.AccessLog())
+	// Order matters: Recovery is innermost so a handler panic becomes a 500
+	// that AccessLog and the activity log still see.
+	r.Use(core.RequestID(), core.AccessLog())
+
+	// Activity log: every API operation, recorded off the request path by a
+	// batching writer. Mounted on the engine (not the /api/v1 group) so
+	// unknown API paths are recorded too. The recorder's context is
+	// cancelled only after the server has drained, so requests finishing
+	// during shutdown are still recorded.
+	recCtx, stopRecorder := context.WithCancel(context.Background())
+	recDone := make(chan struct{})
+	if cfg.ActivityLogEnabled {
+		rec := activity.NewRecorder(pool, cfg.EventLogRetentionDays)
+		go func() { defer close(recDone); rec.Run(recCtx) }()
+		r.Use(activity.Middleware(rec))
+	} else {
+		close(recDone)
+	}
+	r.Use(gin.Recovery())
 
 	v1 := r.Group("/api/v1")
 	events.NewService(pool, rdb, cfg).RegisterRoutes(v1)
@@ -70,6 +89,7 @@ func main() {
 	ai.New(pool, rdb, cfg, wire.NewMetricsProvider(campaignsSvc)).RegisterRoutes(v1)
 	system.RegisterRoutes(v1, pool, rdb, cfg)
 	eventlog.RegisterRoutes(v1, pool)
+	activity.RegisterRoutes(v1, pool)
 	predict.New(pool).RegisterRoutes(v1)
 
 	// Demo topology (CONTRACTS §9): run the event worker in-process so a
@@ -107,4 +127,6 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown", "err", err)
 	}
+	stopRecorder() // flush the activity entries of the drained requests
+	<-recDone
 }

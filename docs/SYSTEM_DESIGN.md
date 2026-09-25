@@ -550,6 +550,20 @@ short of grepping several processes, and the worker's log lines had no
    log insert can never fail the step (logging must not block the data
    path). Ingest writes a whole batch's rows in one `unnest` INSERT.
 
+3. *Activity log* (`activity_logs`, `GET /activity`, migration 000006):
+   one row per API operation — who did what (action, entity, request id,
+   client), with what result (status, latency, handler summary or error).
+   It is recorded by one engine-level middleware, so no endpoint can be
+   forgotten and unknown API paths are covered; errors arrive through
+   `core.RespondError`, summaries through `core.NoteActivity`. Unlike the
+   event log it is written **asynchronously**: a buffered channel and a
+   batch writer (≤200 rows per INSERT every 500 ms), dropping and counting
+   when the buffer is full rather than delaying a request. The cost is that
+   rows buffered at a hard crash are lost and rows lag ~0.5 s — fine for an
+   operator view; a compliance-grade audit trail would write synchronously
+   or to a durable log. Health checks and log reads are not recorded
+   (machine and self-referential traffic). Request bodies are never stored.
+
 **Trade-offs.** `EVENT_LOG_MODE=all` adds ~2 rows (and 5 index entries
 each) per event — the write amplification §8 warns about, on the one
 node that can't scale out. That is why the mode exists: `errors` records

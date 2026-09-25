@@ -101,6 +101,20 @@ paths:
       responses:
         '200': {description: Replayed}
         '404': {description: Not found}
+  /activity:
+    get:
+      summary: Activity log — every API operation with its result, newest first
+      parameters:
+        - {name: action, in: query, schema: {type: string}, description: "exact action (customer.view) or prefix ending in '.' (customer.)"}
+        - {name: entity, in: query, schema: {type: string}, description: path id the operation targeted}
+        - {name: request_id, in: query, schema: {type: string}}
+        - {name: outcome, in: query, schema: {type: string, enum: [ok, error]}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, default: 50, maximum: 200}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: ListResponse<ActivityEntry>, content: {application/json: {schema: {$ref: '#/components/schemas/ActivityPage'}}}}
+        '400': {description: Invalid filter}
   /logs:
     get:
       summary: Event lifecycle log (newest first, cursor-paginated)
@@ -304,3 +318,25 @@ components:
             model: {type: string}
             samples: {type: integer}
             took_ms: {type: integer}
+    ActivityEntry:
+      type: object
+      properties:
+        id: {type: integer}
+        at: {type: string, format: date-time}
+        action: {type: string, description: "e.g. customer.view, prediction.channel, unknown"}
+        method: {type: string}
+        path: {type: string}
+        query: {type: string}
+        entity: {type: string}
+        status: {type: integer}
+        latency_ms: {type: integer}
+        request_id: {type: string}
+        client_ip: {type: string}
+        summary: {type: string, description: handler-supplied outcome}
+        error: {type: string, description: "ErrorBody code: message on failures"}
+    ActivityPage:
+      type: object
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/ActivityEntry'}}
+        next_cursor: {type: string}
+        has_more: {type: boolean}

@@ -106,6 +106,8 @@ func (s *Service) ingest(c *gin.Context) {
 			log.Debug("ingest item rejected", "index", r.Index, "reason", r.Reason)
 		}
 	}
+	core.NoteActivity(c, "%d events: %d accepted, %d duplicates, %d rejected",
+		len(req.Events), resp.Accepted, resp.Duplicates, len(resp.Rejected))
 	c.JSON(http.StatusAccepted, resp)
 }
 

@@ -168,6 +168,12 @@ func (m *Module) predictChannel(c *gin.Context) {
 		"objective", req.Objective, "scope", scope,
 		"recommended", resp.RecommendedChannel, "confidence", resp.Confidence,
 		"prob_best", resp.Channels[0].ProbBest, "took_ms", resp.Meta.TookMs)
+	who := string(scope)
+	if req.CustomerID != "" {
+		who = "customer " + req.CustomerID
+	}
+	core.NoteActivity(c, "%s, %s: recommended %s (%s confidence, %.0f%% chance best)",
+		req.Objective, who, resp.RecommendedChannel, resp.Confidence, resp.Channels[0].ProbBest*100)
 	c.JSON(http.StatusOK, resp)
 }
 

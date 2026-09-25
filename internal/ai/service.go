@@ -75,6 +75,7 @@ func (s *Service) handleAnalyze(c *gin.Context) {
 	ctx := c.Request.Context()
 	key := cacheKey(c.Param("id"), "", "analyze-"+PromptVersion)
 	if body, hit := s.cacheGet(ctx, key); hit {
+		core.NoteActivity(c, "analysis served from cache")
 		c.Data(http.StatusOK, "application/json", body)
 		return
 	}
@@ -99,6 +100,7 @@ func (s *Service) handleAnalyze(c *gin.Context) {
 		core.Internal(c, err)
 		return
 	}
+	core.NoteActivity(c, "analysis by %s (fallback %t)", res.Provider, res.FallbackUsed)
 	s.cacheSet(ctx, key, resp)
 	c.Data(http.StatusOK, "application/json", resp)
 }
@@ -114,6 +116,7 @@ func (s *Service) handleRecommend(c *gin.Context) {
 	}
 	key := cacheKey(c.Param("id"), body.Objective, "recommend-"+PromptVersion)
 	if body2, hit := s.cacheGet(ctx, key); hit {
+		core.NoteActivity(c, "recommendations served from cache")
 		c.Data(http.StatusOK, "application/json", body2)
 		return
 	}
@@ -138,6 +141,8 @@ func (s *Service) handleRecommend(c *gin.Context) {
 		core.Internal(c, err)
 		return
 	}
+	core.NoteActivity(c, "%d recommendations by %s (fallback %t)",
+		len(res.Output.([]Recommendation)), res.Provider, res.FallbackUsed)
 	s.cacheSet(ctx, key, resp)
 	c.Data(http.StatusOK, "application/json", resp)
 }

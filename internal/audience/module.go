@@ -215,6 +215,8 @@ func (m *Module) recommend(c *gin.Context) {
 	if req.respectCap() && len(out) < req.Size {
 		meta.ShortfallReason = "frequency_cap_exhausted"
 	}
+	core.NoteActivity(c, "%d of %d candidates for %s via %s (%d considered)",
+		len(out), req.Size, req.Objective, req.Channel, considered)
 	c.JSON(200, RecommendResponse{Candidates: out, Meta: meta})
 }
 

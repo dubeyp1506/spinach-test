@@ -42,7 +42,10 @@ type Config struct {
 	// "all" records every lifecycle step, "errors" only retry/dead_lettered/
 	// replayed, "off" disables it. EventLogRetentionDays bounds its size.
 	EventLogMode          string
-	EventLogRetentionDays int
+	EventLogRetentionDays int // retention for event_logs AND activity_logs
+	// ActivityLogEnabled records every API operation in activity_logs
+	// (GET /activity) — the "who did what" view in the UI's Logs section.
+	ActivityLogEnabled bool
 }
 
 func Load() (*Config, error) {
@@ -71,6 +74,7 @@ func Load() (*Config, error) {
 		LogFormat:             envStr("LOG_FORMAT", "json"),
 		EventLogMode:          envStr("EVENT_LOG_MODE", "all"),
 		EventLogRetentionDays: envInt("EVENT_LOG_RETENTION_DAYS", 7),
+		ActivityLogEnabled:    envStr("ACTIVITY_LOG_ENABLED", "true") == "true",
 	}
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")

@@ -19,6 +19,7 @@ change, update this file in the same PR that changes the code.
 | A8 Frontend | `web/**` | openapi.yaml |
 | A9 Docs/DevOps | `docs/SYSTEM_DESIGN.md`, `docs/AI_DESIGN.md`, `README.md`, deploy configs | all |
 | A10 Event log | `internal/eventlog/**` (writer + GET /logs); write calls inside `internal/events` and `internal/system` | core |
+| A12 Activity log | `internal/activity/**` (middleware, async writer, GET /activity); handlers only call `core.NoteActivity` | core |
 | A11 Prediction | `internal/predict/**` | core, store; reads `campaign_metrics`, `events`, `engagement_profiles` (SQL only, no module imports) |
 
 Shared files (`cmd/api/main.go`, `go.mod`, `migrations/`) — changes only via
@@ -163,6 +164,7 @@ type LLMProvider interface {
 | GET `/system/health` | A1 | `{status, postgres, redis, queue_depth, dlq_size}` |
 | GET `/system/dlq` | A1 | cursor-paginated DLQ rows |
 | POST `/system/dlq/{id}/replay` | A1 | re-enqueue a DLQ entry (bonus) |
+| GET `/activity` | A12 | every API operation, see §14 |
 | GET `/logs` | A10 | event lifecycle log, see §12 |
 | POST `/predictions/channel` | A11 | best channel for an objective, see §13 |
 
@@ -323,3 +325,21 @@ time. Keep the raw score in the DB. Clamp negative totals at 0.
 - `channels` is ranked by `predicted_rate`; `prob_best` sums to 1;
   `confidence` bands on the winner's `prob_best` (≥0.90 high, ≥0.65 medium).
   Same inputs → same output (fixed RNG seed).
+
+## 14. Activity Log Contract (A12)
+
+- Every request under `/api/` produces one `activity_logs` row (migration
+  000006): action, method, route, path, query (≤500 chars), entity (the
+  path `:id`), status, latency, request id, client IP, user agent,
+  `summary`, `error`. Request bodies are never stored.
+- Skipped: `GET /system/health` (platform health checks) and reads of the
+  logs themselves (`/logs`, `/activity`). Unknown API paths are recorded as
+  action `unknown`.
+- Handlers add the one-line outcome with `core.NoteActivity(c, …)`; errors
+  arrive automatically via `core.RespondError`. Keep summaries PII-free.
+- Writes are asynchronous (buffer 4,096, batches ≤200 every 500 ms); a full
+  buffer drops and counts, never blocks. Rows may lag a request by ~0.5 s.
+- `GET /activity` — newest first, `core.ListResponse`, cursor = last id.
+  Filters: `action` (exact, or prefix ending in `.`, e.g. `customer.`),
+  `entity`, `request_id`, `outcome=ok|error`, `since` (RFC3339).
+

@@ -15,6 +15,7 @@ type ErrorBody struct {
 }
 
 func RespondError(c *gin.Context, status int, code, msg string, details any) {
+	c.Set(ActivityErrorKey, code+": "+msg) // every error lands in the activity log
 	c.AbortWithStatusJSON(status, ErrorBody{Error: code, Message: msg, Details: details})
 }
 

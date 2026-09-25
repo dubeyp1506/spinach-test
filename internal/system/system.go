@@ -156,6 +156,7 @@ func (h *handlers) listDLQ(c *gin.Context) {
 		resp.HasMore = true
 		resp.NextCursor = strconv.FormatInt(entries[len(entries)-1].ID, 10)
 	}
+	core.NoteActivity(c, "listed %d dead-lettered events", len(resp.Data))
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -252,5 +253,10 @@ func (h *handlers) replayDLQ(c *gin.Context) {
 		return
 	}
 	core.Log(ctx).Info("dlq entry replayed", "dlq_id", dlqID, "event_db_id", eventDBID)
+	if eventID != nil {
+		core.NoteActivity(c, "replayed dead-lettered event %s", *eventID)
+	} else {
+		core.NoteActivity(c, "replayed dlq entry %d", dlqID)
+	}
 	c.JSON(http.StatusOK, gin.H{"replayed": true})
 }

@@ -114,6 +114,7 @@ func (s *Service) listCampaigns(c *gin.Context) {
 		resp.Data = items
 		resp.NextCursor = strconv.FormatInt(ids[len(items)-1], 10)
 	}
+	core.NoteActivity(c, "listed %d campaigns", len(resp.Data))
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -150,6 +151,7 @@ func (s *Service) campaignAnalytics(c *gin.Context) {
 		core.Internal(c, err)
 		return
 	}
+	core.NoteActivity(c, "viewed analytics: %d sends, %d anomalies", a.Metrics.Sends, len(a.Anomalies))
 	c.JSON(http.StatusOK, analyticsResponse{
 		CampaignMetrics:  a.Metrics,
 		Anomalies:        a.Anomalies,

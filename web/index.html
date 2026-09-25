@@ -155,8 +155,48 @@
 
     <!-- Logs -->
     <section id="view-logs" class="view">
-      <h2>Event Logs</h2>
-      <p class="hint">GET /logs — every lifecycle step of an event (ingested, duplicate, processed, retry, dead_lettered, replayed), newest first. Click an event_id to see its full history.</p>
+      <h2>Logs</h2>
+      <div class="tabs">
+        <button class="tab active" data-tab="activity">All activity</button>
+        <button class="tab" data-tab="events">Event lifecycle</button>
+      </div>
+
+      <div id="tab-activity" class="tabpanel">
+      <p class="hint">GET /activity — every operation performed through the API (views, searches, predictions, AI analysis, ingests, replays), with its result, newest first.</p>
+      <div class="form">
+        <label>Operation
+          <select id="actAction">
+            <option value="">any</option>
+            <option value="events.">events.*</option>
+            <option value="events.ingest">events.ingest</option>
+            <option value="customer.">customer.*</option>
+            <option value="customer.view">customer.view</option>
+            <option value="customer.timeline">customer.timeline</option>
+            <option value="campaign.">campaign.*</option>
+            <option value="audience.recommend">audience.recommend</option>
+            <option value="prediction.channel">prediction.channel</option>
+            <option value="ai.">ai.*</option>
+            <option value="dlq.">dlq.*</option>
+            <option value="unknown">unknown (404)</option>
+          </select>
+        </label>
+        <label>Outcome
+          <select id="actOutcome">
+            <option value="">any</option><option value="ok">success</option><option value="error">failed</option>
+          </select>
+        </label>
+        <label>Entity (customer / campaign id) <input id="actEntity" spellcheck="false" placeholder="any"></label>
+        <label>request_id <input id="actRequest" spellcheck="false" placeholder="any"></label>
+        <button id="actSearch" class="primary">Search</button>
+        <button id="actClear">Clear filters</button>
+      </div>
+      <div class="error"></div>
+      <div id="actResult"></div>
+      <button id="actMore" class="hidden">Load more</button>
+      </div>
+
+      <div id="tab-events" class="tabpanel hidden">
+      <p class="hint">GET /logs — every lifecycle step of an ingested event (ingested, duplicate, processed, retry, dead_lettered, replayed), newest first. Click an event_id to see its full history.</p>
       <div class="form">
         <label>event_id <input id="logEvent" spellcheck="false" placeholder="any"></label>
         <label>customer_id <input id="logCustomer" spellcheck="false" placeholder="any"></label>
@@ -181,6 +221,7 @@
       <div class="error"></div>
       <div id="logResult"></div>
       <button id="logMore" class="hidden">Load more</button>
+      </div>
     </section>
 
     <!-- 6. System -->

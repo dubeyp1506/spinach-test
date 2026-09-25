@@ -84,6 +84,8 @@ func (m *Module) getCustomer(c *gin.Context) {
 		return
 	}
 
+	core.NoteActivity(c, "viewed profile: score %.2f, trend %s, %d events",
+		m.engine.ScoreFromProfile(p, now), trend, p.TotalEvents)
 	c.JSON(http.StatusOK, customerResponse{
 		CustomerID: extID,
 		Email:      email,
@@ -204,6 +206,7 @@ func (m *Module) getTimeline(c *gin.Context) {
 		last := fetched[len(fetched)-1]
 		next = encodeCursor(last.item.OccurredAt, last.dbID)
 	}
+	core.NoteActivity(c, "viewed timeline: %d events", len(items))
 	c.JSON(http.StatusOK, core.ListResponse[timelineItem]{
 		Data:       items,
 		NextCursor: next,

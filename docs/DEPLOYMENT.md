@@ -145,7 +145,8 @@ pass". Seed once from a laptop against the database's *external* URL:
 | `LOG_LEVEL` | no | `info` | `debug` adds a line per processed event |
 | `LOG_FORMAT` | no | `json` | `text` for local reading; JSON for Cloud Logging/Loki |
 | `EVENT_LOG_MODE` | no | `all` | `errors` at high volume (only retry/dead_lettered/replayed rows); `off` disables |
-| `EVENT_LOG_RETENTION_DAYS` | no | 7 | worker prunes older `event_logs` rows ~once a minute |
+| `EVENT_LOG_RETENTION_DAYS` | no | 7 | retention for `event_logs` (pruned by the worker) and `activity_logs` (pruned by the API) |
+| `ACTIVITY_LOG_ENABLED` | no | `true` | record every API operation in `activity_logs` (`GET /activity`) |
 
 ## 6. Post-deploy checks
 

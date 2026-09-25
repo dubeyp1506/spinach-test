@@ -48,7 +48,8 @@ async function api(path, opts = {}) {
 // Run fn with the view's loading indicator + error envelope display.
 async function busy(view, fn) {
   const sec = $('#view-' + view);
-  const errEl = sec.querySelector('.error');
+  // Views with tabs show errors in the visible panel.
+  const errEl = sec.querySelector('.tabpanel:not(.hidden) .error') || sec.querySelector('.error');
   errEl.textContent = '';
   sec.classList.add('busy');
   try { await fn(); }
@@ -94,7 +95,7 @@ document.querySelectorAll('.nav').forEach(b => b.addEventListener('click', () =>
     v.classList.toggle('active', v.id === 'view-' + b.dataset.view));
   if (b.dataset.view === 'campaigns' && !campLoaded) loadCampaigns();
   if (b.dataset.view === 'system' && !sysLoaded) loadSystem();
-  if (b.dataset.view === 'logs' && !logsLoaded) loadLogs();
+  if (b.dataset.view === 'logs') refreshLogsTab(); // always fresh: shows what you just did
 }));
 
 function showView(view) {
@@ -148,8 +149,8 @@ $('#ingSubmit').onclick = () => busy('ingest', async () => {
 
 $('#ingTrace').onclick = () => {
   setLogFilters({ request_id: lastIngestRequestId });
+  showLogsTab('events', false);
   showView('logs');
-  loadLogs();
 };
 
 /* ---------- 2. Customers ---------- */
@@ -433,9 +434,99 @@ $('#aiRecommend').onclick = () => busy('ai', async () => {
     ${jsonBlock(r)}`;
 });
 
-/* ---------- Logs ---------- */
+/* ---------- Logs: tabs ---------- */
 
-let logsLoaded = false, logCursor = null;
+let logsTab = 'activity';
+
+function showLogsTab(tab, load = true) {
+  logsTab = tab;
+  document.querySelectorAll('#view-logs .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.querySelectorAll('#view-logs .tabpanel').forEach(p => p.classList.toggle('hidden', p.id !== 'tab-' + tab));
+  if (load) refreshLogsTab();
+}
+
+function refreshLogsTab() {
+  return logsTab === 'activity' ? loadActivity() : loadLogs();
+}
+
+document.querySelectorAll('#view-logs .tab').forEach(t =>
+  t.addEventListener('click', () => showLogsTab(t.dataset.tab)));
+
+/* ---------- Logs: all activity ---------- */
+
+let actCursor = null;
+
+const ACT_FILTERS = { action: '#actAction', outcome: '#actOutcome', entity: '#actEntity', request_id: '#actRequest' };
+
+function activityQuery(cursor) {
+  const q = new URLSearchParams({ limit: '50' });
+  Object.entries(ACT_FILTERS).forEach(([k, sel]) => {
+    const v = $(sel).value.trim();
+    if (v) q.set(k, v);
+  });
+  if (cursor) q.set('cursor', cursor);
+  return '/activity?' + q.toString();
+}
+
+function loadActivity() {
+  return busy('logs', async () => {
+    actCursor = null;
+    renderActivity(await api(activityQuery()), true);
+  });
+}
+
+$('#actSearch').onclick = loadActivity;
+$('#actClear').onclick = () => {
+  Object.values(ACT_FILTERS).forEach(sel => { $(sel).value = ''; });
+  loadActivity();
+};
+$('#actMore').onclick = () => busy('logs', async () => {
+  renderActivity(await api(activityQuery(actCursor)), false);
+});
+document.querySelectorAll('#tab-activity input').forEach(i =>
+  i.addEventListener('keydown', e => { if (e.key === 'Enter') loadActivity(); }));
+
+const statusClass = s => (s >= 500 ? 'bad' : s >= 400 ? 'warn' : 'ok');
+
+function renderActivity(r, reset) {
+  const rows = (r.data || []).map(a => `<tr>
+    <td class="small">${fmtTime(a.at)}</td>
+    <td>${badge(a.action, a.action === 'unknown' ? 'warn' : 'accent')}</td>
+    <td class="mono small req-cell">${esc(a.method)} ${esc(a.path.replace(/^\/api\/v1/, ''))}${a.query ? '<span class="muted">?' + esc(a.query) + '</span>' : ''}</td>
+    <td>${badge(a.status, statusClass(a.status))}</td>
+    <td class="num">${fmtNum(a.latency_ms)} ms</td>
+    <td>${a.error ? `<span class="err-cell small">${esc(a.error)}</span>` : esc(a.summary ?? '')}</td>
+    <td class="mono small">${a.request_id
+      ? (a.action === 'events.ingest'
+        ? `<a href="#" class="req-link" data-req="${esc(a.request_id)}" title="${esc(a.request_id)} — show what this ingest caused">${esc(a.request_id.slice(0, 8))}…</a>`
+        : `<span title="${esc(a.request_id)}">${esc(a.request_id.slice(0, 8))}…</span>`)
+      : ''}</td>
+  </tr>`);
+  if (reset || !$('#actTable')) {
+    $('#actResult').innerHTML = `<table id="actTable"><thead><tr>
+      <th>time</th><th>operation</th><th>request</th><th>status</th><th>took</th><th>result</th><th>request_id</th>
+    </tr></thead><tbody></tbody></table>`;
+  }
+  $('#actTable tbody').insertAdjacentHTML('beforeend', rows.join(''));
+  if (reset && !(r.data || []).length) {
+    $('#actResult').innerHTML = '<p class="meta">No activity matches these filters yet. Use any other screen (view a customer, run a prediction, ingest events), then come back.</p>';
+  }
+  actCursor = r.next_cursor || null;
+  $('#actMore').classList.toggle('hidden', !r.has_more);
+}
+
+// An ingest's request_id opens the lifecycle of the events it created.
+$('#actResult').addEventListener('click', e => {
+  const a = e.target.closest('a.req-link');
+  if (!a) return;
+  e.preventDefault();
+  setLogFilters({ request_id: a.dataset.req });
+  showLogsTab('events');
+});
+
+/* ---------- Logs: event lifecycle ---------- */
+
+let logCursor = null;
 
 const LOG_FILTERS = {
   event_id: '#logEvent', customer_id: '#logCustomer', campaign_id: '#logCampaign',
@@ -457,7 +548,6 @@ function logQuery(cursor) {
 }
 
 function loadLogs() {
-  logsLoaded = true;
   return busy('logs', async () => {
     logCursor = null;
     renderLogs(await api(logQuery()), true);
@@ -469,7 +559,7 @@ $('#logClear').onclick = () => { setLogFilters({}); loadLogs(); };
 $('#logMore').onclick = () => busy('logs', async () => {
   renderLogs(await api(logQuery(logCursor)), false);
 });
-document.querySelectorAll('#view-logs input').forEach(i =>
+document.querySelectorAll('#tab-events input').forEach(i =>
   i.addEventListener('keydown', e => { if (e.key === 'Enter') loadLogs(); }));
 
 const levelClass = l => (l === 'error' ? 'bad' : l === 'warn' ? 'warn' : l === 'info' ? 'ok' : '');

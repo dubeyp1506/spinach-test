@@ -137,7 +137,20 @@ validation makes invented stats un-serveable — AI_DESIGN.md §4). With no
 API keys, or with Groq down, you get `provider:"rule-fallback"`,
 `fallback_used:true` — a 200, not an error.
 
-**6. Trace one event through its whole life — structured logs + event log.**
+**6. See every operation, and trace one event through its whole life.**
+
+Every API call — viewing a customer, listing campaigns, a prediction, an AI
+analysis, an ingest, a DLQ replay, even a 404 — becomes a row in the
+activity log with its result or error (UI: **Logs → All activity**):
+
+```bash
+curl 'localhost:8080/api/v1/activity?limit=20'          # newest operations
+curl 'localhost:8080/api/v1/activity?outcome=error'     # only failures
+curl 'localhost:8080/api/v1/activity?entity=cust_00042' # everything done to one customer
+```
+
+The event lifecycle log follows ingested events through processing
+(UI: **Logs → Event lifecycle**, or **Ingest → Trace this batch**):
 
 ```bash
 curl -X POST localhost:8080/api/v1/events -H 'content-type: application/json' \
@@ -194,6 +207,7 @@ instead of a false winner. Design: SYSTEM_DESIGN.md §14.
 | GET | `/system/health` | `{status, postgres, redis, queue_depth, dlq_size}` |
 | GET | `/system/dlq` | Failed events, cursor-paginated |
 | POST | `/system/dlq/{id}/replay` | Re-enqueue a dead-lettered event |
+| GET | `/activity` | Every API operation (who did what, result, latency); `?action=&entity=&request_id=&outcome=ok\|error&since=` |
 | GET | `/logs` | Event lifecycle log, newest first; `?event_id=&customer_id=&campaign_id=&request_id=&stage=&level=&since=` |
 | POST | `/predictions/channel` | Best channel for an objective — platform, audience or one customer |
 
@@ -217,9 +231,10 @@ internal/
   audience     top-K recommender (A3)
   campaigns    metrics service (A4)
   ai           LLM provider chain + bulkhead (A5)
+  activity     activity log of every API operation (middleware + async batch writer) + GET /activity
   eventlog     event lifecycle log (event_logs table) + GET /logs
   predict      channel prediction (hierarchical Beta-Binomial) + POST /predictions/channel
-migrations     SQL schema (000001 init … 000005 event_logs + events.request_id)
+migrations     SQL schema (000001 init … 000005 event_logs, 000006 activity_logs)
 docs           SYSTEM_DESIGN · AI_DESIGN · ARCHITECTURE · DEPLOYMENT · CONTRACTS · openapi.yaml
 scripts        dupe_batch.json (seeded duplicates demo)
 tests          integration / race / failure / API tests
@@ -244,7 +259,7 @@ All via env (see `.env.example`): `DATABASE_URL`, `REDIS_URL`,
 `LLM_TIMEOUT_MS=15000`, `RATE_LIMIT_RPS=500`/`BURST=1000`,
 `RUN_EMBEDDED_WORKER=false` (single-service demo mode — DEPLOYMENT.md §3),
 `LOG_LEVEL=info` / `LOG_FORMAT=json`, `EVENT_LOG_MODE=all|errors|off`,
-`EVENT_LOG_RETENTION_DAYS=7`.
+`EVENT_LOG_RETENTION_DAYS=7` (both logs), `ACTIVITY_LOG_ENABLED=true`.
 
 ## Deploy
 
