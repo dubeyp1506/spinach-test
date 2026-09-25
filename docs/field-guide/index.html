@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Martech Engine Field Guide</title>
+<meta name="description" content="How the martech-engine works: architecture, reliability, scaling from 1M to 100M users, weak points, Q&amp;A and glossary.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&amp;display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <nav class="toc" aria-label="Sections">
+    <div class="brand">Martech Engine</div>
+    <div class="brand-sub">Field guide · architecture, scale, Q&amp;A</div>
+    <ol id="toc">
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#flows">Request lifecycles</a></li>
+      <li><a href="#guarantees">Reliability guarantees</a></li>
+      <li><a href="#scoring">Engagement score</a></li>
+      <li><a href="#data">Data model</a></li>
+      <li><a href="#audience">Audience ranking</a></li>
+      <li><a href="#ai">AI layer</a></li>
+      <li><a href="#scale">Scaling to 100M</a></li>
+      <li><a href="#weak">Weak points</a></li>
+      <li><a href="#qa">Questions &amp; answers</a></li>
+      <li><a href="#glossary">Glossary</a></li>
+      <li><a href="#perf">Measured numbers</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <!-- ====================== OVERVIEW ====================== -->
+    <section id="overview">
+      <div class="hero">
+        <span class="eyebrow">MarTech Intelligence &amp; Campaign Decision Engine</span>
+        <h1>Every event counted <em>once</em>, every number the AI says is <em>real</em>.</h1>
+        <p class="lede">A Go backend that ingests marketing engagement events (sends, opens, clicks, conversions, bounces) from email, SMS, WhatsApp, push and web, turns them into a live engagement score per customer, ranks audiences for the next campaign, and has an LLM explain campaign performance without inventing statistics.</p>
+        <div class="stack">
+          <span class="chip">Go 1.26</span><span class="chip">Gin</span><span class="chip">pgx v5</span><span class="chip">PostgreSQL 16</span><span class="chip">Redis 7 Streams</span><span class="chip">golang-migrate</span><span class="chip">Groq · Gemini</span><span class="chip">Docker</span>
+        </div>
+        <div class="targets" aria-label="Design targets">
+          <div class="target"><b>10M/day</b><span>events ingested (≈116/s avg, sized for ~1.2k/s peaks)</span></div>
+          <div class="target"><b>&lt;100 ms</b><span>p99 ingest latency, one DB transaction per batch</span></div>
+          <div class="target"><b>&lt;10 s</b><span>p99 freshness, event → updated profile</span></div>
+          <div class="target"><b>0</b><span>events lost after the API returns 202</span></div>
+          <div class="target"><b>100%</b><span>duplicate detection, enforced by a Postgres UNIQUE</span></div>
+          <div class="target"><b>100%</b><span>of AI calls answer 200, with a rule-based fallback</span></div>
+        </div>
+      </div>
+
+      <div class="sec-head"><span class="eyebrow">What it does</span><h2>Five jobs, one pipeline</h2></div>
+      <div class="grid3">
+        <div class="card"><span class="tag">Ingest</span><h4>Accept events fast, safely</h4><p>Batches of up to 500 events per call. Each item is validated on its own, duplicates are counted rather than stored, and the API answers <code>202</code> only after the data is durable.</p></div>
+        <div class="card"><span class="tag">Process</span><h4>Build customer intelligence</h4><p>Background workers fold each event into the customer's profile: counters, preferred channel, activity trend, and a decaying engagement score.</p></div>
+        <div class="card"><span class="tag">Analyze</span><h4>Campaign analytics</h4><p>Open, click and conversion rates, per-channel breakdowns and anomaly flags, read from a rollup table so no request scans the raw events.</p></div>
+        <div class="card"><span class="tag">Recommend</span><h4>Pick the next audience</h4><p>Top-K customers for an objective, with score and recency floors, channel filters, frequency caps, and a reason for each pick.</p></div>
+        <div class="card"><span class="tag">Explain</span><h4>AI narrative over facts</h4><p>Go computes the numbers and the LLM only describes them. Output that cites a number Go didn't compute is rejected.</p></div>
+        <div class="card"><span class="tag">Operate</span><h4>See and repair failures</h4><p>A health endpoint shows queue depth and dead-letter size. Failed events can be inspected and replayed through the API.</p></div>
+      </div>
+    </section>
+
+    <!-- ====================== ARCHITECTURE ====================== -->
+    <section id="architecture">
+      <div class="sec-head">
+        <span class="eyebrow">Architecture</span>
+        <h2>Postgres holds the truth. Redis only moves pointers.</h2>
+        <p>Two binaries built from one codebase: a stateless <code>api</code> and a horizontally scalable <code>worker</code>. They never call each other; they coordinate only through Postgres and Redis.</p>
+      </div>
+
+      <div class="figure" role="img" aria-label="Architecture diagram: event sources post to the API; the API writes events and an outbox row to Postgres in one transaction and makes a best-effort publish to Redis Streams; workers read from the stream, process each event in one Postgres transaction, and poll the outbox to republish; the AI layer sits behind the API with a cache, semaphore, circuit breaker and provider chain.">
+        <svg class="dg" viewBox="0 0 1040 560" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+            <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ahd" d="M0,0 L10,5 L0,10 z"/></marker>
+            <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="aha" d="M0,0 L10,5 L0,10 z"/></marker>
+          </defs>
+
+          <!-- Sources -->
+          <rect class="box ext" x="16" y="60" width="160" height="112" rx="10"/>
+          <text class="hd" x="30" y="86">Event sources</text>
+          <text class="row" x="30" y="108">ESP · SMS · WhatsApp</text>
+          <text class="row" x="30" y="126">push · web SDKs</text>
+          <text class="sub" x="30" y="152">client owns event_id</text>
+
+          <!-- API -->
+          <rect class="box" x="222" y="30" width="236" height="290" rx="10"/>
+          <text class="hd" x="238" y="56">api · Gin</text>
+          <text class="sub" x="238" y="72">stateless · N replicas · :8080</text>
+          <rect class="rowbg" x="236" y="84" width="208" height="30" rx="6"/><text class="row" x="248" y="104">RequestID · logs · 4 MiB cap</text>
+          <rect class="rowbg" x="236" y="120" width="208" height="30" rx="6"/><text class="row" x="248" y="140">Token bucket (Redis Lua)</text>
+          <rect class="rowbg" x="236" y="156" width="208" height="30" rx="6"/><text class="row" x="248" y="176">Per-item validation</text>
+          <rect class="rowbg" x="236" y="192" width="208" height="30" rx="6"/><text class="row" x="248" y="212">Ingest handler</text>
+          <rect class="rowbg" x="236" y="228" width="208" height="30" rx="6"/><text class="row" x="248" y="248">Read: customers · campaigns</text>
+          <rect class="rowbg" x="236" y="264" width="208" height="30" rx="6"/><text class="row" x="248" y="284">AI: analyze · recommend</text>
+
+          <!-- Postgres -->
+          <rect class="box pg" x="540" y="30" width="232" height="290" rx="10"/>
+          <text class="hd" x="556" y="56">PostgreSQL 16</text>
+          <text class="sub" x="556" y="72">source of truth · dedup</text>
+          <text class="rowm" x="556" y="100">events</text><text class="sub" x="650" y="100">UNIQUE(event_id)</text>
+          <text class="rowm" x="556" y="124">event_outbox</text><text class="sub" x="664" y="124">same tx</text>
+          <text class="rowm" x="556" y="148">engagement_profiles</text>
+          <text class="rowm" x="556" y="172">campaign_metrics</text><text class="sub" x="694" y="172">rollup</text>
+          <text class="rowm" x="556" y="196">sends</text><text class="sub" x="610" y="196">freq-cap source</text>
+          <text class="rowm" x="556" y="220">events_dlq</text>
+          <text class="rowm" x="556" y="244">customers · campaigns</text>
+          <text class="sub" x="556" y="300">pgx pool MaxConns 20</text>
+
+          <!-- Workers -->
+          <rect class="box" x="838" y="30" width="186" height="290" rx="10"/>
+          <text class="hd" x="852" y="56">worker × N</text>
+          <text class="sub" x="852" y="72">group "event-workers"</text>
+          <rect class="rowbg" x="850" y="84" width="162" height="44" rx="6"/><text class="row" x="860" y="102">Outbox reconciler</text><text class="sub" x="860" y="119">every 5 s · SKIP LOCKED</text>
+          <rect class="rowbg" x="850" y="134" width="162" height="44" rx="6"/><text class="row" x="860" y="152">Pending sweeper</text><text class="sub" x="860" y="169">pending &gt; 30 s</text>
+          <rect class="rowbg" x="850" y="184" width="162" height="44" rx="6"/><text class="row" x="860" y="202">XREADGROUP 100</text><text class="sub" x="860" y="219">× 8 goroutines</text>
+          <rect class="rowbg" x="850" y="234" width="162" height="44" rx="6"/><text class="row" x="860" y="252">Process tx</text><text class="sub" x="860" y="269">lock → check → apply</text>
+          <text class="sub" x="852" y="302">XAUTOCLAIM idle &gt; 30 s</text>
+
+          <!-- Redis -->
+          <rect class="box" x="540" y="388" width="232" height="148" rx="10"/>
+          <text class="hd" x="556" y="414">Redis 7</text>
+          <text class="sub" x="556" y="430">transport + caches, not truth</text>
+          <text class="rowm" x="556" y="456">stream:events</text><text class="sub" x="668" y="456">MAXLEN ~1M</text>
+          <text class="rowm" x="556" y="478">stream:events:dlq</text>
+          <text class="rowm" x="556" y="500">ai cache</text><text class="sub" x="626" y="500">TTL 60 s</text>
+          <text class="rowm" x="556" y="522">ratelimit:events:&lt;ip&gt;</text>
+
+          <!-- AI -->
+          <rect class="box" x="222" y="388" width="236" height="148" rx="10"/>
+          <text class="hd" x="238" y="414">AI bulkhead</text>
+          <text class="row" x="238" y="440">cache → semaphore (8)</text>
+          <text class="row" x="238" y="460">→ breaker per provider</text>
+          <text class="row" x="238" y="480">→ groq → gemini → rules</text>
+          <text class="sub" x="238" y="504">validate: schema · confidence</text>
+          <text class="sub" x="238" y="520">· number containment</text>
+
+          <!-- LLM -->
+          <rect class="box ext" x="16" y="420" width="160" height="80" rx="10"/>
+          <text class="hd" x="30" y="448">LLM APIs</text>
+          <text class="row" x="30" y="470">Groq · Gemini</text>
+          <text class="sub" x="30" y="488">15 s timeout each</text>
+
+          <!-- edges -->
+          <path class="edge" d="M176 116 H218" marker-end="url(#a1)"/>
+          <text class="lbl" x="178" y="108">POST</text>
+
+          <path class="edge" d="M444 207 H490 V110 H536" marker-end="url(#a1)"/>
+          <text class="lbl" x="468" y="100">ONE tx</text>
+
+          <path class="edge" d="M444 243 H536" marker-end="url(#a1)"/>
+          <text class="lbl" x="512" y="236">reads</text>
+
+          <path class="edge dash" d="M444 215 H506 V420 H536" marker-end="url(#a2)"/>
+          <text class="lbl" x="468" y="372">best-effort</text>
+          <text class="lbl" x="484" y="386">XADD</text>
+
+          <path class="edge" d="M836 256 H776" marker-end="url(#a1)"/>
+          <text class="lbl" x="784" y="248">apply</text>
+          <path class="edge" d="M836 106 H776" marker-end="url(#a1)"/>
+          <text class="lbl" x="782" y="98">poll</text>
+
+          <path class="edge" d="M776 462 H930 V324" marker-start="url(#a1)" marker-end="url(#a1)"/>
+          <text class="lbl" x="790" y="454">XADD · XREADGROUP · XACK</text>
+
+          <path class="edge ai" d="M340 298 V384" marker-end="url(#a3)"/>
+          <path class="edge ai" d="M222 460 H180" marker-end="url(#a3)"/>
+          <path class="edge ai" d="M458 500 H536" marker-end="url(#a3)"/>
+          <text class="lbl" x="472" y="492">cache</text>
+        </svg>
+      </div>
+      <p class="figcap">Solid teal = the durable path. Dashed grey = the fast path, which may fail without losing data. Amber = the AI path, isolated so an LLM outage can't hold API resources.</p>
+
+      <div class="grid2" style="margin-top:22px">
+        <div class="card"><span class="tag">cmd/api</span><h4>HTTP server</h4><p>Gin router, middleware (request ID, access log, body cap), rate limiter, handlers for all 11 endpoints. Runs migrations on boot. With <code>RUN_EMBEDDED_WORKER=true</code> it also runs the worker loop as a goroutine, which suits single-service free-tier deploys.</p></div>
+        <div class="card"><span class="tag">cmd/worker</span><h4>Consumer + reconciler</h4><p>Reads the stream as part of a consumer group, processes each event in one transaction, reclaims stuck messages from dead peers, republishes anything the API failed to publish, and dead-letters poison events.</p></div>
+        <div class="card"><span class="tag">internal/*</span><h4>Modules</h4><p><code>events</code> ingest + worker · <code>customers</code> scoring · <code>audience</code> top-K · <code>campaigns</code> analytics · <code>ai</code> provider chain · <code>queue</code> stream interface · <code>core</code> middleware &amp; pagination · <code>store</code> pool + migrations.</p></div>
+        <div class="card"><span class="tag">Seams for later</span><h4>Built to be swapped</h4><p><code>queue.Producer</code>/<code>queue.Consumer</code> interfaces make Kafka a drop-in replacement. <code>LLMProvider</code> makes a new model a single adapter. <code>core.Metrics</code> is where Prometheus plugs in.</p></div>
+      </div>
+
+      <h3 style="margin:34px 0 12px">API surface <span class="mono" style="font-weight:400; color:var(--muted); font-size:.8rem">/api/v1</span></h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Method</th><th>Path</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><span class="verb">POST</span></td><td><code>/events</code></td><td>Ingest ≤500 events → <code>202 {accepted, duplicates, rejected[]}</code></td></tr>
+          <tr><td><span class="verb get">GET</span></td><td><code>/customers/{id}</code></td><td>Profile + live engagement score</td></tr>
+          <tr><td><span class="verb get">GET</span></td><td><code>/customers/{id}/timeline</code></td><td>Cursor-paginated events, newest first, filter by channel/type</td></tr>
+          <tr><td><span class="verb get">GET</span></td><td><code>/campaigns</code></td><td>List + summary metrics</td></tr>
+          <tr><td><span class="verb get">GET</span></td><td><code>/campaigns/{id}/analytics</code></td><td>Counts, rates, per-channel, anomaly flags</td></tr>
+          <tr><td><span class="verb">POST</span></td><td><code>/audience/recommend</code></td><td>Top-K ranked, frequency-capped audience with reasons</td></tr>
+          <tr><td><span class="verb">POST</span></td><td><code>/campaigns/{id}/analyze</code></td><td>AI narrative over computed facts</td></tr>
+          <tr><td><span class="verb">POST</span></td><td><code>/campaigns/{id}/recommend</code></td><td>AI recommendations for an objective</td></tr>
+          <tr><td><span class="verb get">GET</span></td><td><code>/system/health</code></td><td>Postgres, Redis, queue depth, DLQ size</td></tr>
+          <tr><td><span class="verb get">GET</span></td><td><code>/system/dlq</code></td><td>Failed events, paginated</td></tr>
+          <tr><td><span class="verb">POST</span></td><td><code>/system/dlq/{id}/replay</code></td><td>Re-enqueue a dead-lettered event</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <!-- ====================== FLOWS ====================== -->
+    <section id="flows">
+      <div class="sec-head">
+        <span class="eyebrow">Request lifecycles</span>
+        <h2>What happens, step by step</h2>
+        <p>The order of each step matters: most of the correctness comes from what happens inside a single transaction and what happens after it commits.</p>
+      </div>
+      <div class="flows">
+        <div class="flow">
+          <div class="flow-head"><h3>1 · Ingest (write path)</h3><span class="mono">POST /events · internal/events/service.go</span></div>
+          <ol class="steps">
+            <li><b>Size + rate check.</b> 4 MiB body cap. The token bucket charges <code>len(events)</code> tokens, not 1 per request, so a 500-event batch costs 500.</li>
+            <li><b>Per-item validation.</b> Required fields, channel/type enums, <code>occurred_at</code> not in the future. A bad item goes into <code>rejected[{index, reason}]</code> and the rest continue. Malformed JSON → <code>400</code> for the whole request.</li>
+            <li><b>Resolve ids.</b> Two <code>ANY($1)</code> lookups map every external <code>customer_id</code>/<code>campaign_id</code> to an internal BIGINT. Unknown ids are rejected per item.</li>
+            <li><b>One transaction.</b> A multi-row <code>INSERT … ON CONFLICT (event_id) DO NOTHING RETURNING id</code>. A returned row is a new event; no row means a duplicate, which is counted. An <code>event_outbox</code> row is inserted for each new event in the <em>same</em> transaction.</li>
+            <li><b>Commit, then answer 202.</b> The event is durable before the client hears back.</li>
+            <li><b>Best-effort publish.</b> Pipelined <code>XADD stream:events {event_db_id}</code>, then the outbox row is deleted. If this fails, nothing is lost; the reconciler covers it.</li>
+          </ol>
+        </div>
+        <div class="flow">
+          <div class="flow-head"><h3>2 · Process (worker path)</h3><span class="mono">internal/events/worker.go · customers/applier.go</span></div>
+          <ol class="steps">
+            <li><b>Read.</b> <code>XREADGROUP</code> up to 100 messages, spread over 8 goroutines. Periodically <code>XAUTOCLAIM</code> messages idle &gt;30 s, which belonged to a crashed peer.</li>
+            <li><b>Lock, then check.</b> <code>SELECT … FROM events WHERE id=$1 FOR UPDATE</code>. If the status is already <code>processed</code>/<code>failed</code>, commit, ack and stop. This is what makes redelivery harmless.</li>
+            <li><b>Apply.</b> Lock the <code>engagement_profiles</code> row. Update counters, channel counts, <code>GREATEST(last_event_at)</code> and the anchored decayed score. Insert into <code>sends</code> for <code>sent</code> events, upsert the <code>campaign_metrics</code> daily rollup, and bump <code>customers.last_event_at</code>.</li>
+            <li><b>Flip status.</b> <code>status='processed'</code> in the <em>same</em> transaction, then <code>COMMIT</code>, then <code>XACK</code>.</li>
+            <li><b>On error.</b> Roll back and record <code>attempts++</code> and <code>last_error</code> in a separate transaction. At 5 attempts: <code>status='failed'</code> + <code>events_dlq</code> row + <code>XADD stream:events:dlq</code> + <code>XACK</code>.</li>
+            <li><b>Safety nets (every ~5 s).</b> The reconciler publishes leftover outbox rows (<code>FOR UPDATE SKIP LOCKED</code>, so workers don't contend). The pending sweeper re-enqueues events stuck in <code>pending</code> for over 30 s.</li>
+          </ol>
+        </div>
+        <div class="flow">
+          <div class="flow-head"><h3>3 · Read paths</h3><span class="mono">customers · campaigns · audience</span></div>
+          <ol class="steps">
+            <li><b>Profile.</b> <code>customers</code> ⋈ <code>engagement_profiles</code>. The raw score is decayed to <em>now</em> and normalized <code>s/(s+k)</code> only at read time.</li>
+            <li><b>Timeline.</b> Index <code>(customer_id, occurred_at DESC)</code> with a keyset cursor on <code>(occurred_at, id)</code>. Pages stay stable when late events arrive, unlike <code>OFFSET</code>.</li>
+            <li><b>Analytics.</b> Read from <code>campaign_metrics</code> (campaign × channel × type × day). Cost is proportional to rollup rows, never an <code>events</code> scan. Rates and anomaly flags are computed in Go.</li>
+          </ol>
+        </div>
+        <div class="flow">
+          <div class="flow-head"><h3>4 · AI analysis</h3><span class="mono">POST /campaigns/{id}/analyze · internal/ai</span></div>
+          <ol class="steps">
+            <li><b>Cache first.</b> Redis key on campaign + objective + endpoint + <code>prompt_version</code>, TTL 60 s. It is checked before the metrics query, so a hit costs about 1 ms.</li>
+            <li><b>Facts in Go.</b> <code>AnalyticsService.Metrics</code> builds a <code>CampaignMetrics</code> struct (counts, rates, per-channel, anomalies). No PII and no raw rows.</li>
+            <li><b>Semaphore.</b> Max 8 LLM calls in flight per replica; overflow gets an immediate <code>429</code>.</li>
+            <li><b>Breaker → provider chain.</b> <code>groq → gemini → rule-fallback</code>. A provider whose breaker is open (after 3 straight failures, probed again after 30 s) is skipped instantly.</li>
+            <li><b>Validate.</b> JSON schema, <code>confidence ∈ [0,1]</code>, and number containment. Invalid output gets one corrective retry, then the next provider.</li>
+            <li><b>Always 200.</b> The response is <code>{facts, analysis, provider, fallback_used}</code>, so any degradation is visible to the caller.</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====================== GUARANTEES ====================== -->
+    <section id="guarantees">
+      <div class="sec-head">
+        <span class="eyebrow">Reliability guarantees</span>
+        <h2>Four invariants that carry the design</h2>
+        <p>At-least-once delivery combined with an idempotent consumer is easier to get right than exactly-once delivery, and it gives the same result: each event takes effect exactly once.</p>
+      </div>
+      <div class="inv">
+        <div class="card">
+          <h4>No lost events after 202 <span class="mono">outbox</span></h4>
+          <p>The event row and its outbox row commit together. "Committed but not yet published" becomes a state you can query and repair, not a silent loss.</p>
+          <p class="why">Why: commit and publish to two different systems can't be atomic. The naive version, <code>COMMIT; XADD</code>, loses the event if the process crashes between the two.</p>
+        </div>
+        <div class="card">
+          <h4>Duplicates never double-count <span class="mono">UNIQUE</span></h4>
+          <p><code>events.event_id UNIQUE</code> is the only dedup authority. The Redis <code>SETNX</code> hint is written after commit and never consulted when classifying duplicates.</p>
+          <p class="why">Why: an evicted or stale Redis key must never be able to accept a duplicate or reject a legitimate retry.</p>
+        </div>
+        <div class="card">
+          <h4>No partial application <span class="mono">one tx</span></h4>
+          <p>The profile update, rollup, sends insert and <code>status='processed'</code> commit together. Each event is either fully applied or not applied at all.</p>
+          <p class="why">Why: if the profile committed but the status didn't, a redelivery would apply the event twice and nothing would reveal it.</p>
+        </div>
+        <div class="card">
+          <h4>Redelivery is a no-op <span class="mono">lock → check</span></h4>
+          <p>Status is checked <em>after</em> taking the row lock. Two workers racing on the same event serialize; the second sees <code>processed</code> and acks.</p>
+          <p class="why">Why: check-then-lock leaves a time-of-check/time-of-use (TOCTOU) window in which both workers see <code>pending</code>.</p>
+        </div>
+      </div>
+      <h3 style="margin:30px 0 12px">Failure funnel</h3>
+      <pre class="code"><span class="c"># every failure has somewhere to go</span>
+XADD fails after commit     <span class="k">→</span> reconciler republishes within ~5 s
+stream entry evicted        <span class="k">→</span> pending sweeper re-enqueues after 30 s
+worker dies mid-message     <span class="k">→</span> tx rolls back; peer XAUTOCLAIMs after 30 s idle
+process tx fails            <span class="k">→</span> rollback, attempts++ (max 5)
+attempts exhausted          <span class="k">→</span> status='failed' + events_dlq + DLQ stream + XACK
+operator fixes root cause   <span class="k">→</span> POST /system/dlq/{id}/replay</pre>
+    </section>
+
+    <!-- ====================== SCORING ====================== -->
+    <section id="scoring">
+      <div class="sec-head">
+        <span class="eyebrow">Engagement score</span>
+        <h2>A decaying sum that doesn't care about arrival order</h2>
+        <p>Clients report <code>occurred_at</code>, and mobile or offline sources deliver events hours late. The score is built so the final value is the same in any delivery order.</p>
+      </div>
+      <div class="prose">
+        <div class="formula">
+          <span class="lbl">Definition: each event is worth its weight, fading with a 14-day half-life</span>
+          <span>score(now) = Σ wᵢ · e<sup>−λ(now − tᵢ)</sup>&nbsp;&nbsp;&nbsp;λ = ln2 / 14 d ≈ 0.0495 / day</span>
+          <span class="lbl">In order (t ≥ anchor): decay what you have, then add</span>
+          <span>raw′ = raw · e<sup>−λ(t − anchor)</sup> + w,&nbsp;&nbsp; anchor = t</span>
+          <span class="lbl">Late (t &lt; anchor): decay the new event to the anchor, anchor unchanged</span>
+          <span>raw′ = raw + w · e<sup>−λ(anchor − t)</sup></span>
+          <span class="lbl">At read time only</span>
+          <span>display = s / (s + k),&nbsp; k = 10,&nbsp; clamp raw ≥ 0</span>
+        </div>
+        <p>Both branches update the same closed-form sum, so there's no need to re-sort history. The score is normalized only when displayed: <code>s/(s+k)</code> is nonlinear, so decaying a normalized value would give the wrong answer. Updates are O(1) per event, inside the processing transaction.</p>
+        <h4 style="margin-top:8px">Event weights <span class="mono" style="font-weight:400; color:var(--muted); font-size:.78rem">internal/customers/scoring.go</span></h4>
+        <div class="weights">
+          <div class="w"><span>sent</span><b class="zero">0</b></div>
+          <div class="w"><span>delivered</span><b class="pos">+0.2</b></div>
+          <div class="w"><span>opened</span><b class="pos">+1</b></div>
+          <div class="w"><span>clicked</span><b class="pos">+2</b></div>
+          <div class="w"><span>converted</span><b class="pos">+5</b></div>
+          <div class="w"><span>bounced</span><b class="neg">−1</b></div>
+          <div class="w"><span>unsubscribed</span><b class="neg">−3</b></div>
+          <div class="w"><span>complained</span><b class="neg">−5</b></div>
+        </div>
+        <p>Other profile fields are also order-safe: counters are <code>+1</code> and <code>last_event_at</code> uses <code>GREATEST</code>. <code>activity_trend</code> compares the last 7 days with the 7 days before. The one field that isn't order-safe is <code>last_event_type</code> (see weak points).</p>
+      </div>
+    </section>
+
+    <!-- ====================== DATA ====================== -->
+    <section id="data">
+      <div class="sec-head">
+        <span class="eyebrow">Data model</span>
+        <h2>Eight tables, and every index has a named query</h2>
+        <p>Internal BIGINT ids keep joins cheap; clients only see <code>external_id</code> strings. Enums are <code>TEXT + CHECK</code>, so adding a channel is a constraint swap, not a table-locking enum migration.</p>
+      </div>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Table</th><th>Role</th><th>Key indexes</th></tr></thead>
+        <tbody>
+          <tr><td><code>events</code></td><td>Every accepted event, with status/attempts. Source of truth.</td><td><code>UNIQUE(event_id)</code>, <code>(customer_id, occurred_at DESC)</code>, <code>(campaign_id, type, occurred_at)</code>, partial <code>(status) WHERE pending</code></td></tr>
+          <tr><td><code>event_outbox</code></td><td>Carries event ids to the stream. Deleted once published, so it stays near 0 rows.</td><td>partial <code>(id) WHERE published_at IS NULL</code></td></tr>
+          <tr><td><code>engagement_profiles</code></td><td>Per-customer counters, channel counts, raw score + anchor, trend, preferred channel</td><td><code>(engagement_score DESC)</code>, <code>(last_event_at DESC)</code>, covering <code>idx_profiles_audience … INCLUDE(…)</code></td></tr>
+          <tr><td><code>campaign_metrics</code></td><td>Daily rollup: campaign × channel × type × day → count</td><td>PK on all four</td></tr>
+          <tr><td><code>sends</code></td><td>Authoritative send history for frequency caps</td><td><code>(customer_id, sent_at DESC)</code>, <code>(campaign_id, sent_at DESC)</code></td></tr>
+          <tr><td><code>events_dlq</code></td><td>Dead-lettered events with payload, error, attempts, replayed_at</td><td>PK</td></tr>
+          <tr><td><code>customers</code></td><td>Identity, email, JSONB attributes, is_active</td><td><code>UNIQUE(external_id)</code></td></tr>
+          <tr><td><code>campaigns</code></td><td>Objective, channel, status, frequency cap (default 3 per 168 h)</td><td><code>UNIQUE(external_id)</code></td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <!-- ====================== AUDIENCE ====================== -->
+    <section id="audience">
+      <div class="sec-head">
+        <span class="eyebrow">Audience ranking</span>
+        <h2>Picking the best 50 out of millions without sorting millions</h2>
+      </div>
+      <div class="flow">
+        <ol class="steps">
+          <li><b>Indexed prefilter in SQL.</b> Score floor, recency, channel and <code>is_active</code>, streamed in <code>engagement_score DESC</code> order from the covering index as an index-only scan. <code>min_score</code> arrives normalized and is converted back to raw units (<code>raw = 10·s/(1−s)</code>).</li>
+          <li><b>Bounded pool.</b> <code>LIMIT min(10·size, 200 000)</code>. <code>meta.candidates_truncated</code> says whether the cut was reached.</li>
+          <li><b>Objective reweighting.</b> <code>raw + a·log1p(conversions) + b·log1p(positive) + c·log1p(days_dormant)</code>. For example, <code>conversion</code> boosts converters and <code>reactivation</code> rewards dormancy. Log scaling keeps heavy users from swamping the ranking.</li>
+          <li><b>Min-heap of size K.</b> O(N log K) time and O(K) memory. Rows are streamed from pgx and never all loaded at once.</li>
+          <li><b>Frequency cap.</b> One batched <code>GROUP BY customer_id</code> over <code>sends</code> in the campaign window for the K survivors. That is 1 query, not K.</li>
+          <li><b>Reasons.</b> Explanations are generated only for the survivors, so the cost is O(K), not O(N).</li>
+        </ol>
+      </div>
+      <div class="callout" style="margin-top:16px">Benchmark (<code>internal/audience/bench_test.go</code>): heap top-K takes <b>9.3 ms and 341 KB</b>, versus <b>238 ms and 112 MB</b> for a full sort, at N = 1,000,000 and K = 1,000. That's about 25× faster.</div>
+    </section>
+
+    <!-- ====================== AI ====================== -->
+    <section id="ai">
+      <div class="sec-head">
+        <span class="eyebrow">AI layer</span>
+        <h2>The LLM describes the facts. It never produces them.</h2>
+        <p>Every number shown to the user is computed in Go before the prompt is built, and that one decision shapes the rest of the layer.</p>
+      </div>
+      <div class="grid2">
+        <div class="card"><span class="tag">Guardrail</span><h4>Number containment</h4><p>Every number in the model's prose must match a value in <code>facts</code>, or a direct derivation such as rate × 100, within ±0.05 rounding. The model can't cite a statistic Go didn't compute.</p></div>
+        <div class="card"><span class="tag">Bulkhead</span><h4>An outage stays contained</h4><p>A dedicated HTTP client with a 15 s timeout, a semaphore of 8, a per-provider circuit breaker (3 failures → open, 30 s half-open), and a response cache. An LLM outage degrades one feature; it doesn't take down the site.</p></div>
+        <div class="card"><span class="tag">Fallback</span><h4>Deterministic templates</h4><p>If both providers fail, Go templates render the same schema from the same facts. The fallback makes no network calls, so it can't fail. <code>fallback_used: true</code> tells the caller it was used.</p></div>
+        <div class="card"><span class="tag">Privacy</span><h4>No PII in prompts, by construction</h4><p>The AI layer receives a <code>CampaignMetrics</code> struct, not database rows, so a careless prompt edit can't leak an email address. Keeping raw text out of the prompt also narrows the prompt-injection surface.</p></div>
+      </div>
+    </section>
+
+    <!-- ====================== SCALE ====================== -->
+    <section id="scale">
+      <div class="sec-head">
+        <span class="eyebrow">Scaling plan</span>
+        <h2>From 1 million to 100 million customers</h2>
+        <p>What breaks first at each tier, and the change that fixes it. The numbers are estimates from stated assumptions, not load-test results.</p>
+      </div>
+      <p class="assume"><b>Assumptions:</b> about 5 events per customer per day (a send plus delivered, open, click and conversion across channels); peak = 10× average during a campaign blast; about 1 KB per stored event including indexes; about 7 row writes per event in Postgres today (events insert, outbox insert + delete, status update, profile upsert, rollup upsert, customer touch). Measured single-worker throughput is about 800–1,200 msg/s.</p>
+      <div class="switch">
+      <input type="radio" name="tier" id="r-now" class="sr">
+      <input type="radio" name="tier" id="r-1m" class="sr" checked>
+      <input type="radio" name="tier" id="r-10m" class="sr">
+      <input type="radio" name="tier" id="r-100m" class="sr">
+      <div class="tabs">
+        <label class="tab" for="r-now">Today<small>50k seeded</small></label>
+        <label class="tab" for="r-1m">1M users<small>5M events/day</small></label>
+        <label class="tab" for="r-10m">10M users<small>50M events/day</small></label>
+        <label class="tab" for="r-100m">100M users<small>500M events/day</small></label>
+      </div>
+
+      <div class="tier" id="p-now">
+        <div class="tier-nums">
+          <div><b>50k</b><span>customers seeded</span></div>
+          <div><b>370k</b><span>events in bench dataset</span></div>
+          <div><b>~60 ms</b><span>per 500-event batch</span></div>
+          <div><b>1 + 2</b><span>api + worker replicas (compose)</span></div>
+        </div>
+        <p class="tier-lede">Single Postgres, single Redis, api + 2 workers (or one service with the embedded worker on Cloud Run/Render + Neon + Upstash). The design is already sized for 10M events/day, so this tier has a lot of headroom.</p>
+        <div class="topo">clients → api ×1 → Postgres (single primary)
+                  ↘ Redis (stream + cache) → worker ×2</div>
+      </div>
+
+      <div class="tier" id="p-1m">
+        <div class="tier-nums">
+          <div><b>~58/s</b><span>avg events</span></div>
+          <div><b>~600/s</b><span>peak events</span></div>
+          <div><b>~4k/s</b><span>peak row writes</span></div>
+          <div><b>~5 GB</b><span>new event data per day</span></div>
+          <div><b>~450 GB</b><span>at 90-day retention</span></div>
+        </div>
+        <p class="tier-lede">Throughput-wise, the current architecture handles this <b>without code changes</b>. 1–2 workers cover the peak, and 1M profile rows are small. Storage and operations are what need work.</p>
+        <div class="breaks">
+          <div class="break"><div class="b-what">Unbounded <code>events</code> growth<small>Index bloat and slower vacuum; an unpartitioned table is harder to prune.</small></div><div class="b-fix">Monthly <code>PARTITION BY RANGE (occurred_at)</code>. Keep 90 days hot; export older partitions to Parquet in object storage, then <code>DROP</code> them (instant retention).</div></div>
+          <div class="break"><div class="b-what">Single primary is a SPOF<small>No automatic failover in the demo setup.</small></div><div class="b-fix">Managed Postgres (RDS/Cloud SQL/Neon) with a synchronous standby and automatic failover. Add PgBouncer in front so N api + worker pods don't exceed <code>max_connections</code>.</div></div>
+          <div class="break"><div class="b-what">Separate api and worker deployments<small>The embedded worker shares the API's lifecycle.</small></div><div class="b-fix">Run <code>api ×3</code> behind a load balancer and <code>worker ×2–3</code> as separate deployments. Autoscale workers on <code>queue_depth</code> / <code>oldest_pending_age</code>.</div></div>
+          <div class="break"><div class="b-what">No auth, IP-keyed rate limits<small>Everything behind one NAT shares one bucket.</small></div><div class="b-fix">API keys or JWT, per-key token buckets, and a separate budget for AI routes.</div></div>
+          <div class="break"><div class="b-what">Blind operations<small>Counters exist only in process.</small></div><div class="b-fix">Prometheus + OpenTelemetry using the existing metric names. Alert on <code>oldest_pending_age</code> and <code>dlq_size</code> growth first.</div></div>
+        </div>
+        <div class="topo">LB → api ×3 ─┬→ PgBouncer → Postgres primary (+ sync standby, + 1 read replica)
+             └→ Redis (managed, replica, AOF)  ←→  worker ×2–3 (HPA on queue lag)</div>
+      </div>
+
+      <div class="tier" id="p-10m">
+        <div class="tier-nums">
+          <div><b>~580/s</b><span>avg events</span></div>
+          <div><b>~6k/s</b><span>peak events</span></div>
+          <div><b>~40k/s</b><span>peak row writes</span></div>
+          <div><b>~50 GB</b><span>new event data per day</span></div>
+          <div><b>~4.5 TB</b><span>at 90-day retention</span></div>
+        </div>
+        <p class="tier-lede">Workers are easy to add (6–8 cover the peak). <b>The single Postgres primary becomes the bottleneck</b>: write amplification, WAL volume, autovacuum churn from status updates and outbox deletes, and hot rows.</p>
+        <div class="breaks">
+          <div class="break"><div class="b-what">Hot rollup rows<small>During a 10M-recipient blast, every <code>opened</code> event for campaign X upserts the same <code>(campaign, channel, type, day)</code> row, so all workers queue on one row lock.</small></div><div class="b-fix">Pre-aggregate in the worker: collapse each 100-message batch into per-key deltas and apply one <code>UPDATE count = count + n</code>. Or shard counters (<code>…, shard SMALLINT</code>, summed on read).</div></div>
+          <div class="break"><div class="b-what">~7 row writes per event<small>The outbox insert + delete, plus the status flip, each create dead tuples.</small></div><div class="b-fix">Micro-batch the processing transaction (lock 100 events at once, <code>UPDATE … WHERE id = ANY</code>). Replace the table outbox with CDC (Debezium reading the WAL). Drop the per-event status flip once idempotency moves to the consumer (next tier).</div></div>
+          <div class="break"><div class="b-what">Analytics and audience reads compete with writes<small>Prefilter scans and reporting run on the primary.</small></div><div class="b-fix">Route read paths to replicas (writes and every <code>FOR UPDATE</code> stay on the primary). Dual-write events to <b>ClickHouse</b> from the stream for campaign analytics.</div></div>
+          <div class="break"><div class="b-what">Redis Streams limits<small>In-memory, trimmed at ~1M entries, single shard; a 6k/s burst of lag fills it in minutes.</small></div><div class="b-fix">Move to <b>Kafka/Redpanda</b> through the existing <code>queue.Producer/Consumer</code> interface. Durable retention, replay, partitioned consumers. Keep Redis for cache and rate limits.</div></div>
+          <div class="break"><div class="b-what">Fleet-wide AI limits<small>A semaphore of 8 per replica × N replicas can blow through provider quotas; breakers don't share state.</small></div><div class="b-fix">An LLM gateway (LiteLLM/Portkey or in-house) with shared breakers, budgets and cache, or Redis-backed distributed semaphores.</div></div>
+        </div>
+        <div class="topo">LB → api ×6 → Kafka (events topic, key = customer_id, 24–48 partitions)
+                         │
+      worker ×8 ─────────┤ micro-batched tx → Postgres primary (partitioned) + 2 read replicas
+      ch-sink ───────────┘ → ClickHouse (campaign analytics, 13-month history)
+Redis cluster: AI cache · rate limits · hot profile cache</div>
+      </div>
+
+      <div class="tier" id="p-100m">
+        <div class="tier-nums">
+          <div><b>~5.8k/s</b><span>avg events</span></div>
+          <div><b>~58k/s</b><span>peak events</span></div>
+          <div><b>~400k/s</b><span>row writes if unchanged</span></div>
+          <div><b>~500 GB</b><span>new event data per day</span></div>
+          <div><b>~45 TB</b><span>at 90-day retention</span></div>
+        </div>
+        <p class="tier-lede">Row-at-a-time transactional updates on one database can't keep up at this volume. The design moves from "update a row per event" to <b>stream processing with keyed state</b>, and Postgres stops being the event store. The contracts stay the same: at-least-once delivery, an idempotent consumer, and order-independent scoring.</p>
+        <div class="breaks">
+          <div class="break"><div class="b-what">Per-event profile writes<small>100M profiles × several updates per day saturates any single primary.</small></div><div class="b-fix"><b>Flink</b> (or Kafka Streams) keyed by <code>customer_id</code>. Profile counters and the anchored score live in keyed state. The anchored-decay math is associative, so it maps directly to a streaming reducer. Emit snapshots to the serving store every few seconds.</div></div>
+          <div class="break"><div class="b-what">Global <code>UNIQUE(event_id)</code><small>A single-index dedup authority can't span shards.</small></div><div class="b-fix">Partition the idempotency key by the same key as the stream (<code>customer_id</code>). Dedup in Flink keyed state (<code>event_id</code> set with a 7-day TTL, or a RocksDB-backed Bloom filter plus exact check) and use Kafka idempotent producers. The sink upserts on <code>(customer_id, event_id)</code>.</div></div>
+          <div class="break"><div class="b-what">Serving store for 100M profiles<small>Point reads at high QPS plus snapshot writes.</small></div><div class="b-fix">Shard: <b>Citus/Vitess</b> Postgres by <code>customer_id</code>, or <b>ScyllaDB/DynamoDB</b> for profiles. Timelines move to ClickHouse or a wide-column store with TTL.</div></div>
+          <div class="break"><div class="b-what">Audience selection over 100M<small>Even an index-only prefilter over tens of millions of rows is too slow per request.</small></div><div class="b-fix">Precompute segments as <b>Roaring bitmaps</b> (per channel, score band, recency band) and intersect them in milliseconds. Score the candidates from a feature store; keep frequency caps in a Redis sorted set per customer with TTL, or a Flink-maintained counter.</div></div>
+          <div class="break"><div class="b-what">Ingest front door<small>~58k events/s at peak, global clients.</small></div><div class="b-fix">Stateless edge ingest in several regions that validates and produces straight to regional Kafka, with a 202 on broker ack (<code>acks=all</code>). Durability moves from the Postgres commit to Kafka's replicated log. Add per-tenant quotas and priority lanes, so transactional events never queue behind a bulk import.</div></div>
+          <div class="break"><div class="b-what">Cost and retention<small>45 TB of hot data is expensive.</small></div><div class="b-fix">Tiered storage: Kafka tiered segments, ClickHouse hot 30 d / S3 cold, Parquet + Iceberg lakehouse for history and model training.</div></div>
+        </div>
+        <div class="topo">edge ingest (multi-region) → Kafka (key=customer_id, 256+ partitions, tiered storage)
+      ├→ Flink: dedup + profiles + rollups (keyed state, exactly-once sinks)
+      │     ├→ profile store (Scylla / Citus)   ← GET /customers, recommend
+      │     └→ Redis: frequency caps, hot caches
+      ├→ ClickHouse (analytics, timelines)       ← GET /campaigns/*/analytics
+      ├→ S3 + Iceberg (history, ML features)
+      └→ segment builder → Roaring bitmaps       ← POST /audience/recommend
+LLM gateway (shared budget, breakers, cache)   ← analyze / recommend</div>
+      </div>
+      </div>
+    </section>
+
+    <!-- ====================== WEAK POINTS ====================== -->
+    <section id="weak">
+      <div class="sec-head">
+        <span class="eyebrow">Weak points</span>
+        <h2>Where this system is weakest, and the fix for each</h2>
+        <p>Taken from the code, not only the docs. Severity reflects the impact at production scale.</p>
+      </div>
+      <div class="switch">
+      <input type="radio" name="sev" id="sev-all" class="sr" checked>
+      <input type="radio" name="sev" id="sev-high" class="sr">
+      <input type="radio" name="sev" id="sev-medium" class="sr">
+      <input type="radio" name="sev" id="sev-low" class="sr">
+      <div class="filterbar">
+        <label class="fbtn" for="sev-all">All</label>
+        <label class="fbtn" for="sev-high">High</label>
+        <label class="fbtn" for="sev-medium">Medium</label>
+        <label class="fbtn" for="sev-low">Low</label>
+      </div>
+      <div class="weak" id="weakList">
+        <article class="wp" data-sev="high"><span class="sev high">High</span><div class="wp-body"><h4>Single Postgres primary is both the bottleneck and a single point of failure</h4><dl><dt>Symptom</dt><dd>Every write, dedup check, row lock and most reads hit one node. If it's down, ingest returns errors.</dd><dt>Fix</dt><dd>Now: managed HA with a standby and PgBouncer. Next: read replicas, partitioning. Later: shard by <code>customer_id</code> (Citus) or move processing into stream state.</dd></dl></div></article>
+        <article class="wp" data-sev="high"><span class="sev high">High</span><div class="wp-body"><h4>Write amplification: about 7 row writes per event</h4><dl><dt>Symptom</dt><dd>Events insert, outbox insert + delete, status UPDATE, profile upsert, rollup upsert and a <code>customers.last_event_at</code> update. That means heavy WAL, dead tuples and autovacuum load, at roughly 7× the event rate.</dd><dt>Fix</dt><dd>Micro-batch the process transaction; replace the table outbox with CDC; drop the per-event customer touch (it's already on the profile); move toward stream processing at 100M.</dd></dl></div></article>
+        <article class="wp" data-sev="high"><span class="sev high">High</span><div class="wp-body"><h4>Hot-row contention on <code>campaign_metrics</code> during a blast</h4><dl><dt>Symptom</dt><dd>All events for one campaign/channel/type/day upsert the same row, so parallel workers serialize on its lock. Processing lag spikes exactly when a campaign launches.</dd><dt>Fix</dt><dd>Aggregate deltas per batch in the worker before writing, use sharded counter rows, or compute rollups in ClickHouse/Flink.</dd></dl></div></article>
+        <article class="wp" data-sev="high"><span class="sev high">High</span><div class="wp-body"><h4>No authentication, authorization or tenant isolation</h4><dl><dt>Symptom</dt><dd>Anyone who can reach the API can ingest events, read profiles, trigger paid LLM calls or replay the DLQ.</dd><dt>Fix</dt><dd>API keys or OIDC JWT middleware before the router; scopes (ingest vs read vs admin); a <code>tenant_id</code> on every table plus row-level security; audit log for DLQ replays.</dd></dl></div></article>
+        <article class="wp" data-sev="medium"><span class="sev medium">Medium</span><div class="wp-body"><h4>Rate limiter fails open and is keyed by client IP</h4><dl><dt>Symptom</dt><dd>If Redis is down, <code>/events</code> has no throttle at the moment backpressure matters most. Clients behind a shared NAT or proxy share one bucket, and a spoofed <code>X-Forwarded-For</code> can change the IP Gin reports if trusted proxies aren't configured.</dd><dt>Fix</dt><dd>Key buckets by API key; configure Gin trusted proxies; fall back to an in-process limiter when Redis is unreachable instead of allowing everything.</dd></dl></div></article>
+        <article class="wp" data-sev="medium"><span class="sev medium">Medium</span><div class="wp-body"><h4>Redis Streams isn't a durable log</h4><dl><dt>Symptom</dt><dd>Memory-bound, trimmed at ~1M entries, no long replay. Correctness survives (Postgres is the truth), but a Redis failure turns the ~5 s reconciler and 30 s sweeper into the only path, so freshness drops from under a second to tens of seconds.</dd><dt>Fix</dt><dd>Managed Redis with a replica and AOF now; Kafka via the <code>queue</code> interface at 10M+.</dd></dl></div></article>
+        <article class="wp" data-sev="medium"><span class="sev medium">Medium</span><div class="wp-body"><h4>Events for unknown customers are rejected</h4><dl><dt>Symptom</dt><dd>Ingest resolves <code>customer_id</code> against <code>customers</code>, and there's no customer create/upsert endpoint. A web event for a new visitor is dropped as <code>unknown customer_id</code>.</dd><dt>Fix</dt><dd>Upsert unknown customers at ingest (<code>INSERT … ON CONFLICT DO NOTHING</code>), or park them in a pending table; add an identity-resolution step that merges anonymous IDs with known ones.</dd></dl></div></article>
+        <article class="wp" data-sev="medium"><span class="sev medium">Medium</span><div class="wp-body"><h4>Approximate top-K and fewer than K results</h4><dl><dt>Symptom</dt><dd>The candidate pool is cut by raw score before objective reweighting, so a true top-K customer can be missed. The frequency cap runs after the heap, which can return fewer than <code>size</code>.</dd><dt>Fix</dt><dd>Both are reported honestly (<code>candidates_truncated</code>, <code>filtered_out</code>). Improve by oversampling K (e.g. 1.3×K before the cap), indexing an objective-specific score, or precomputing segments.</dd></dl></div></article>
+        <article class="wp" data-sev="medium"><span class="sev medium">Medium</span><div class="wp-body"><h4>AI controls are per replica, not fleet-wide</h4><dl><dt>Symptom</dt><dd>A semaphore of 8 and breakers exist in each process, so 10 replicas allow 80 concurrent calls and each needs 3 failures of its own to trip. Worst-case latency before fallback can reach tens of seconds (15 s timeout per call, one corrective retry per provider).</dd><dt>Fix</dt><dd>An LLM gateway or Redis-backed shared breaker and semaphore; shorter timeouts (the 8B model usually answers in &lt;2 s); an overall deadline across the whole chain.</dd></dl></div></article>
+        <article class="wp" data-sev="medium"><span class="sev medium">Medium</span><div class="wp-body"><h4>Observability is in-process only</h4><dl><dt>Symptom</dt><dd>Counters reset on restart and can't be aggregated across replicas; there's no tracing from ingest to processing.</dd><dt>Fix</dt><dd>Prometheus exporters under the same names; OTel tracing that carries <code>request_id</code> into the stream message; SLO alerts on <code>oldest_pending_age</code> and DLQ growth.</dd></dl></div></article>
+        <article class="wp" data-sev="medium"><span class="sev medium">Medium</span><div class="wp-body"><h4>No right-to-erasure path</h4><dl><dt>Symptom</dt><dd><code>events</code>, <code>sends</code> and profiles reference <code>customers</code> without <code>ON DELETE CASCADE</code>, so deleting a customer fails. Payloads also live in the DLQ and any Parquet exports.</dd><dt>Fix</dt><dd>A deletion workflow: cascade or tombstone, scrub JSONB payloads, crypto-shred PII by customer key, and propagate deletes to archives.</dd></dl></div></article>
+        <article class="wp" data-sev="low"><span class="sev low">Low</span><div class="wp-body"><h4>A late event can't correct <code>last_event_type</code></h4><dl><dt>Symptom</dt><dd>Counters and score are order-safe, but "latest event type" reflects arrival order, not time order, for late data.</dd><dt>Fix</dt><dd>Update it only when <code>occurred_at ≥ last_event_at</code> (the same guard as <code>GREATEST</code>), or rebuild profiles from <code>events</code> periodically.</dd></dl></div></article>
+        <article class="wp" data-sev="low"><span class="sev low">Low</span><div class="wp-body"><h4>Score floor is slightly over-inclusive</h4><dl><dt>Symptom</dt><dd>The prefilter compares <code>min_score</code> against stored, anchor-time raw scores, which haven't been decayed to now, so dormant customers can pass the floor.</dd><dt>Fix</dt><dd>Apply the decay at query time (<code>engagement_score * exp(-λ·(now-score_updated_at))</code>) as a post-filter, or re-anchor idle profiles in a nightly job.</dd></dl></div></article>
+        <article class="wp" data-sev="low"><span class="sev low">Low</span><div class="wp-body"><h4>Embedded-worker mode ties processing to the API</h4><dl><dt>Symptom</dt><dd>On free tiers with scale-to-zero, nothing processes until a request wakes the service; a deploy kills in-flight work (safely, but slowly).</dd><dt>Fix</dt><dd><code>min-instances=1</code> for demos; separate worker deployments in production.</dd></dl></div></article>
+        <article class="wp" data-sev="low"><span class="sev low">Low</span><div class="wp-body"><h4>Rule-based scoring, uncalibrated AI confidence</h4><dl><dt>Symptom</dt><dd>Event weights and objective boosts are hand-tuned constants; <code>confidence</code> is reported by the model, and the fallback is a template.</dd><dt>Fix</dt><dd>Learn weights from conversion outcomes (logistic regression or GBM on profile features), A/B test recommendations, and calibrate confidence against real results.</dd></dl></div></article>
+      </div>
+      </div>
+    </section>
+
+    <!-- ====================== Q&A ====================== -->
+    <section id="qa">
+      <div class="sec-head">
+        <span class="eyebrow">Questions &amp; answers</span>
+        <h2>What reviewers and interviewers will ask, with answers</h2>
+      </div>
+      <div class="switch">
+      <input type="radio" name="qcat" id="q-all" class="sr" checked>
+      <input type="radio" name="qcat" id="q-design" class="sr">
+      <input type="radio" name="qcat" id="q-reliability" class="sr">
+      <input type="radio" name="qcat" id="q-data" class="sr">
+      <input type="radio" name="qcat" id="q-audience" class="sr">
+      <input type="radio" name="qcat" id="q-ai" class="sr">
+      <input type="radio" name="qcat" id="q-scale" class="sr">
+      <input type="radio" name="qcat" id="q-ops" class="sr">
+      <div class="filterbar">
+        <label class="fbtn" for="q-all">All</label>
+        <label class="fbtn" for="q-design">Design</label>
+        <label class="fbtn" for="q-reliability">Reliability</label>
+        <label class="fbtn" for="q-data">Data &amp; scoring</label>
+        <label class="fbtn" for="q-audience">Audience</label>
+        <label class="fbtn" for="q-ai">AI</label>
+        <label class="fbtn" for="q-scale">Scale</label>
+        <label class="fbtn" for="q-ops">Ops &amp; security</label>
+      </div>
+      <div class="qa" id="qaList">
+        <details class="q" data-cat="Design"><summary><span class="cat">Design</span>Why is Postgres the dedup authority instead of a Redis SETNX check?</summary><div class="a"><p>Redis can evict, flush or fail over, and a missing key would let a duplicate through, while a stale key could reject a legitimate retry. <code>INSERT … ON CONFLICT (event_id) DO NOTHING RETURNING id</code> makes the dedup decision in the same statement as the write: one index probe and no extra round trip. The Redis hint is written after commit and is only an optimization.</p></div></details>
+        <details class="q" data-cat="Design"><summary><span class="cat">Design</span>Why Redis Streams and not Kafka?</summary><div class="a"><p>Streams give consumer groups, per-message acks, a pending-entries list and <code>XAUTOCLAIM</code>, which is everything needed for at-least-once delivery with crash recovery, at a fraction of Kafka's operational cost. The stream carries only a pointer (<code>event_db_id</code>), so losing Redis costs latency, not data. Kafka becomes the right answer when you need retention and replay beyond days, more than about 50k msg/s, or lag that survives eviction. The <code>queue.Producer/Consumer</code> interfaces make that a swap of implementation, not a rewrite.</p></div></details>
+        <details class="q" data-cat="Design"><summary><span class="cat">Design</span>Why return 202 and not 200 or 201?</summary><div class="a"><p>202 means "accepted for asynchronous processing". The event is durable when the response is sent, but it isn't reflected in the profile yet (p99 target under 10 s). The body gives exact counts: <code>accepted</code>, <code>duplicates</code>, <code>rejected[]</code>.</p></div></details>
+        <details class="q" data-cat="Design"><summary><span class="cat">Design</span>Why accept part of a batch instead of rejecting the whole thing?</summary><div class="a"><p>Rejecting 499 good events because of one bad one punishes good data for bad data and makes clients retry everything. Per-item validation returns <code>rejected[{index, reason}]</code>. The trade-off is that clients must inspect the response. Malformed JSON still fails the whole request with 400.</p></div></details>
+        <details class="q" data-cat="Design"><summary><span class="cat">Design</span>Why separate api and worker binaries?</summary><div class="a"><p>Ingest and processing scale on different axes (request rate vs. processing cost) and should fail independently. A processing backlog shouldn't slow ingest. The same <code>Run()</code> function powers both the standalone worker and the embedded goroutine for single-service demos.</p></div></details>
+        <details class="q" data-cat="Design"><summary><span class="cat">Design</span>Why TEXT + CHECK instead of Postgres enums?</summary><div class="a"><p>Adding a channel such as <code>rcs</code> becomes <code>ALTER … DROP/ADD CONSTRAINT</code> instead of an enum change that can't easily be reversed and has awkward transaction semantics. The database still rejects invalid values.</p></div></details>
+
+        <details class="q" data-cat="Reliability"><summary><span class="cat">Reliability</span>What if the API crashes right after COMMIT but before XADD?</summary><div class="a"><p>The outbox row was committed in the same transaction as the event. Within about 5 s, a worker's reconciler selects unpublished rows with <code>FOR UPDATE SKIP LOCKED</code>, publishes them and deletes them. The client already has a 202, and the event is processed a few seconds later than usual.</p></div></details>
+        <details class="q" data-cat="Reliability"><summary><span class="cat">Reliability</span>What if Redis is completely wiped?</summary><div class="a"><p>Stream entries are only pointers. Unpublished ones are republished from the outbox, and published-but-unconsumed ones are caught by the pending sweeper (<code>status='pending'</code> older than 30 s). The AI cache becomes a miss and rate buckets refill. Dedup is unaffected because it lives in Postgres. Nothing is lost; latency goes up temporarily.</p></div></details>
+        <details class="q" data-cat="Reliability"><summary><span class="cat">Reliability</span>What if a worker dies mid-message?</summary><div class="a"><p>Its transaction rolls back and the message stays in the consumer group's pending list, un-acked. After 30 s idle, a peer's <code>XAUTOCLAIM</code> takes it over. If the worker died <em>after</em> commit but before <code>XACK</code>, the new owner locks the row, sees <code>processed</code> and just acks.</p></div></details>
+        <details class="q" data-cat="Reliability"><summary><span class="cat">Reliability</span>Is this exactly-once?</summary><div class="a"><p>Delivery is at-least-once, on purpose: the API and the reconciler can both publish, and reclaims redeliver. The <em>effect</em> is exactly-once because processing is idempotent: lock the event row, check its status, then apply and flip status in one transaction. That's simpler and more robust than distributed exactly-once delivery.</p></div></details>
+        <details class="q" data-cat="Reliability"><summary><span class="cat">Reliability</span>Why lock-then-check instead of check-then-lock?</summary><div class="a"><p>With check-then-lock, two workers can both read <code>pending</code>, then both lock in turn and both apply the event. That's a TOCTOU race. Taking <code>FOR UPDATE</code> first serializes them, so the second sees <code>processed</code>. It costs one row lock per message.</p></div></details>
+        <details class="q" data-cat="Reliability"><summary><span class="cat">Reliability</span>How do you handle poison messages?</summary><div class="a"><p>Each failure rolls back the work and increments <code>attempts</code> in a separate transaction. At 5 attempts the event is marked <code>failed</code>, copied to <code>events_dlq</code> with payload and error, published to <code>stream:events:dlq</code>, and acked so it can't block the group. <code>POST /system/dlq/{id}/replay</code> re-enqueues it after a fix.</p></div></details>
+        <details class="q" data-cat="Reliability"><summary><span class="cat">Reliability</span>Can two workers deadlock?</summary><div class="a"><p>The risk is low because lock order is fixed: event row → profile row → sends insert. Locks are held only for the transaction (milliseconds), and <code>statement_timeout</code> (10 s) bounds any stuck query.</p></div></details>
+
+        <details class="q" data-cat="Data"><summary><span class="cat">Data &amp; scoring</span>How does the score stay correct when events arrive out of order?</summary><div class="a"><p>The score is a decayed sum stored as a raw value plus an anchor time. An in-order event decays the stored value to its own time and adds its weight. A late event is decayed to the anchor and added. Both are updates to the same closed-form sum, so the result is the same for any arrival order, with no re-sorting.</p></div></details>
+        <details class="q" data-cat="Data"><summary><span class="cat">Data &amp; scoring</span>Why store the raw score and not the normalized 0–1 value?</summary><div class="a"><p>Normalization <code>s/(s+k)</code> is nonlinear, so decaying a normalized number gives the wrong answer. Decay is exponential on the raw sum; normalization happens only for display.</p></div></details>
+        <details class="q" data-cat="Data"><summary><span class="cat">Data &amp; scoring</span>Why keyset pagination on the timeline?</summary><div class="a"><p><code>OFFSET</code> gets slower with depth and shifts when late events are inserted, so users see duplicates or skip rows. A cursor on <code>(occurred_at, id)</code> backed by <code>(customer_id, occurred_at DESC)</code> is stable and uses the index at any depth.</p></div></details>
+        <details class="q" data-cat="Data"><summary><span class="cat">Data &amp; scoring</span>Why does analytics read a rollup instead of the events table?</summary><div class="a"><p><code>events</code> grows forever; a <code>GROUP BY</code> over it per request gets slower every day. The worker upserts <code>campaign_metrics</code> in the same transaction that processes the event, so analytics costs are proportional to rollup rows (campaign × channel × type × day).</p></div></details>
+
+        <details class="q" data-cat="Audience"><summary><span class="cat">Audience</span>How do you find the top 50 customers out of millions quickly?</summary><div class="a"><p>An indexed SQL prefilter (covering index, index-only scan in score order) is capped at <code>min(10·size, 200k)</code> rows. Those rows stream through a min-heap of size K: O(N log K) time and O(K) memory. Then one batched frequency-cap query runs on the survivors. The benchmark shows 9.3 ms vs 238 ms for a full sort at N = 1M.</p></div></details>
+        <details class="q" data-cat="Audience"><summary><span class="cat">Audience</span>Why might I get fewer customers than I asked for?</summary><div class="a"><p>The frequency cap is checked after ranking, because checking it for every candidate would be far more expensive. Capped customers are removed and counted in <code>meta.filtered_out</code>. Respecting the cap takes priority over filling the audience.</p></div></details>
+        <details class="q" data-cat="Audience"><summary><span class="cat">Audience</span>Is the ranking exact?</summary><div class="a"><p>No. The pool is cut by raw score before the objective reweighting, so someone just below the cut could have ranked in after the boost. <code>meta.candidates_truncated</code> says when that cut applied. Exact ranking at multi-million scale belongs in an analytical store or precomputed segments.</p></div></details>
+        <details class="q" data-cat="Audience"><summary><span class="cat">Audience</span>How does the objective change the ranking?</summary><div class="a"><p>Log-scaled boosts: <code>conversion</code> adds 0.30·log1p(conversions); <code>engagement</code> adds 0.25·log1p(positive events); <code>reactivation</code> adds 0.30·log1p(days dormant), which rewards lapsed customers with history. Log scaling stops one very heavy user from dominating the list.</p></div></details>
+
+        <details class="q" data-cat="AI"><summary><span class="cat">AI</span>How do you stop the LLM from inventing numbers?</summary><div class="a"><p>Two layers. First, the model never sees raw data: Go computes every metric and passes a facts JSON. Second, number containment: every numeric literal in the output must match a fact or a direct derivation (±0.05 rounding). Otherwise the output is rejected, retried once with a corrective prompt, then the next provider is tried.</p></div></details>
+        <details class="q" data-cat="AI"><summary><span class="cat">AI</span>What happens when Groq is down?</summary><div class="a"><p>After 3 consecutive failures its breaker opens and later requests skip it instantly. Gemini is tried next; if it also fails, the deterministic rule fallback renders the same schema from the same facts. The endpoint still returns 200 with <code>provider:"rule-fallback"</code> and <code>fallback_used:true</code>.</p></div></details>
+        <details class="q" data-cat="AI"><summary><span class="cat">AI</span>Why does the AI endpoint sometimes return 429?</summary><div class="a"><p>The semaphore allows 8 in-flight LLM calls per replica. Rejecting the excess immediately protects goroutines, memory, the DB pool and provider spend. Cache hits never use a slot.</p></div></details>
+        <details class="q" data-cat="AI"><summary><span class="cat">AI</span>Is customer data sent to the LLM?</summary><div class="a"><p>No. The AI layer receives only a <code>CampaignMetrics</code> struct of aggregate counts and rates. That's structural, so a prompt edit can't add emails or names. It also leaves little room for prompt injection, since no user-supplied text reaches the prompt.</p></div></details>
+
+        <details class="q" data-cat="Scale"><summary><span class="cat">Scale</span>What breaks first as traffic grows?</summary><div class="a"><p>The single Postgres primary. Each event causes about 7 row writes (with WAL and vacuum load), and blasts create a hot row in <code>campaign_metrics</code>. Workers and API pods scale out easily; the database doesn't. See the 10M tab for fixes.</p></div></details>
+        <details class="q" data-cat="Scale"><summary><span class="cat">Scale</span>How do you scale processing?</summary><div class="a"><p>Add worker replicas (<code>docker compose up --scale worker=N</code>, or HPA on queue lag). The consumer group splits messages across workers, <code>SKIP LOCKED</code> keeps reconcilers from contending, and row locks make races safe. No code changes are needed.</p></div></details>
+        <details class="q" data-cat="Scale"><summary><span class="cat">Scale</span>What about one "hot" customer with a flood of events?</summary><div class="a"><p>Their events serialize on the profile row lock. That's intentional, because read-modify-write on counters needs it, and other customers keep processing in parallel. At 100M scale, partitioning the stream by <code>customer_id</code> removes the lock entirely: one consumer owns each key.</p></div></details>
+        <details class="q" data-cat="Scale"><summary><span class="cat">Scale</span>How does the system survive a 10× traffic spike?</summary><div class="a"><p>Backpressure at every layer: the edge token bucket (cost = events), a 500-item batch cap, the durable outbox, the stream as a buffer, and workers draining at their own pace. Under sustained overload, freshness degrades linearly while correctness holds. 429s push retries to clients, and retries are safe because clients own the idempotency keys.</p></div></details>
+        <details class="q" data-cat="Scale"><summary><span class="cat">Scale</span>How do you keep the events table from growing forever?</summary><div class="a"><p>Monthly range partitions on <code>occurred_at</code>, 90 days hot, older partitions exported to Parquet and dropped. A partition drop is instant, unlike <code>DELETE</code>. Analytics history moves to ClickHouse or BigQuery.</p></div></details>
+
+        <details class="q" data-cat="Ops"><summary><span class="cat">Ops &amp; security</span>How would you know events are silently not being processed?</summary><div class="a"><p>Watch <code>oldest_pending_age</code> (the oldest unpublished outbox row or oldest pending stream entry) and <code>dlq_size</code> growth. Queue depth alone can look flat while one event is stuck. <code>/system/health</code> exposes <code>queue_depth</code> and <code>dlq_size</code> today.</p></div></details>
+        <details class="q" data-cat="Ops"><summary><span class="cat">Ops &amp; security</span>How do you trace a failed request?</summary><div class="a"><p>Every request gets an <code>X-Request-ID</code> (echoed back), and the access log and every error path include it. Production would carry it into the stream message and OTel spans, so one ID links ingest → worker → DLQ.</p></div></details>
+        <details class="q" data-cat="Ops"><summary><span class="cat">Ops &amp; security</span>What about SQL injection and secrets?</summary><div class="a"><p>All queries are parameterized through pgx (<code>$1…</code>), with no string-built SQL. CHECK constraints bound enum values in the DB. Secrets come from env vars only (<code>.env</code> is gitignored); production uses a secret manager, and nothing secret is logged.</p></div></details>
+        <details class="q" data-cat="Ops"><summary><span class="cat">Ops &amp; security</span>What's missing before this goes to production?</summary><div class="a"><p>Auth (API keys/JWT) with per-key rate limits, multi-tenancy, HA Postgres + PgBouncer, Prometheus/OTel, a GDPR deletion path, customer upsert at ingest, and a fleet-wide LLM gateway. All of these are listed under weak points above.</p></div></details>
+      </div>
+      </div>
+    </section>
+
+    <!-- ====================== GLOSSARY ====================== -->
+    <section id="glossary">
+      <div class="sec-head">
+        <span class="eyebrow">Glossary</span>
+        <h2>Terms used in this project</h2>
+      </div>
+      <dl class="gloss" id="gloss">
+        <div class="term"><dt>Idempotency key <small>event_id</small></dt><dd>A client-generated unique ID. Sending the same event twice has the same effect as sending it once.</dd></div>
+        <div class="term"><dt>Idempotent consumer</dt><dd>A processor that can safely receive the same message more than once, here via lock-then-check on <code>events.status</code>.</dd></div>
+        <div class="term"><dt>At-least-once delivery</dt><dd>Every message is delivered one or more times; never zero. Duplicates are expected and handled.</dd></div>
+        <div class="term"><dt>Exactly-once effect</dt><dd>Delivery may repeat, but the observable result is as if each event were applied once.</dd></div>
+        <div class="term"><dt>Transactional outbox</dt><dd>Writing a "to be published" row in the same DB transaction as the business data, so publishing can be retried from a durable record.</dd></div>
+        <div class="term"><dt>Reconciler</dt><dd>A worker loop (~5 s) that publishes outbox rows the API failed to publish, then deletes them.</dd></div>
+        <div class="term"><dt>Pending sweeper</dt><dd>Re-enqueues events stuck in <code>pending</code> for over 30 s, covering stream entries lost after publish.</dd></div>
+        <div class="term"><dt>Redis Streams</dt><dd>An append-only log type in Redis, with consumer groups and per-message acknowledgements.</dd></div>
+        <div class="term"><dt>Consumer group</dt><dd>A set of workers sharing a stream; each message goes to one member. Here: <code>event-workers</code>.</dd></div>
+        <div class="term"><dt>XADD / XREADGROUP / XACK</dt><dd>Append to a stream / read as a group member / confirm a message is done.</dd></div>
+        <div class="term"><dt>PEL <small>pending entries list</small></dt><dd>Messages delivered to a consumer but not yet acked. Survives consumer crashes.</dd></div>
+        <div class="term"><dt>XAUTOCLAIM</dt><dd>Takes over PEL messages idle longer than a threshold (30 s) from another consumer, usually a dead one.</dd></div>
+        <div class="term"><dt>MAXLEN ~</dt><dd>Approximate stream trimming (~1M entries) to cap Redis memory.</dd></div>
+        <div class="term"><dt>DLQ <small>dead-letter queue</small></dt><dd>Where events go after 5 failed attempts, with payload and error, for inspection and replay.</dd></div>
+        <div class="term"><dt>Poison message</dt><dd>A message that fails every time. Retry caps stop it from blocking the queue.</dd></div>
+        <div class="term"><dt>SELECT … FOR UPDATE</dt><dd>Row lock held until the transaction ends. Serializes concurrent writers on the same row.</dd></div>
+        <div class="term"><dt>SKIP LOCKED</dt><dd>Skip rows already locked by others. Lets many reconcilers share the outbox without waiting.</dd></div>
+        <div class="term"><dt>TOCTOU</dt><dd>Time-of-check to time-of-use race: state changes between checking it and acting on it.</dd></div>
+        <div class="term"><dt>ON CONFLICT DO NOTHING</dt><dd>Postgres upsert variant: silently skip rows that violate a unique constraint. Used for dedup.</dd></div>
+        <div class="term"><dt>Out-of-order (OOO) events</dt><dd>Events whose arrival order differs from their <code>occurred_at</code> order.</dd></div>
+        <div class="term"><dt>Exponential decay / half-life</dt><dd>A value that halves every fixed period (14 days here), so recent activity counts more.</dd></div>
+        <div class="term"><dt>Anchored decay</dt><dd>Storing a raw score plus the time it's valid at, and decaying lazily on the next write or read.</dd></div>
+        <div class="term"><dt>Engagement score</dt><dd>Weighted, decayed sum of a customer's events, shown as <code>s/(s+10)</code> in [0,1).</dd></div>
+        <div class="term"><dt>Rollup</dt><dd>Pre-aggregated counts (campaign × channel × type × day) maintained on write so reads are cheap.</dd></div>
+        <div class="term"><dt>Frequency cap</dt><dd>Maximum sends per customer per window (default 3 per 168 h) to prevent over-messaging.</dd></div>
+        <div class="term"><dt>Top-K / min-heap</dt><dd>Keep only the best K items seen so far in a heap whose root is the weakest; O(N log K).</dd></div>
+        <div class="term"><dt>Prefilter</dt><dd>Cheap indexed SQL filtering that shrinks N before expensive ranking in Go.</dd></div>
+        <div class="term"><dt>Covering index <small>INCLUDE</small></dt><dd>An index holding every column a query needs, allowing an index-only scan with no table reads.</dd></div>
+        <div class="term"><dt>Partial index</dt><dd>An index over only the rows matching a predicate, e.g. <code>WHERE status='pending'</code>. Small and fast.</dd></div>
+        <div class="term"><dt>Keyset (cursor) pagination</dt><dd>Paging by "after this (occurred_at, id)" instead of OFFSET. Stable and index-friendly.</dd></div>
+        <div class="term"><dt>Token bucket</dt><dd>A rate limiter: tokens refill at a fixed rate up to a burst size; each request spends tokens.</dd></div>
+        <div class="term"><dt>Fail open</dt><dd>When a guard's dependency fails, allow traffic rather than block it. The rate limiter does this if Redis is down.</dd></div>
+        <div class="term"><dt>Backpressure</dt><dd>Letting slower downstream stages push back on (or buffer) faster upstream stages instead of collapsing.</dd></div>
+        <div class="term"><dt>Bulkhead</dt><dd>Isolating a risky dependency's resources so its failure can't sink the rest of the system.</dd></div>
+        <div class="term"><dt>Circuit breaker</dt><dd>Stops calling a failing dependency (open), then probes it again after a cool-down (half-open).</dd></div>
+        <div class="term"><dt>Semaphore</dt><dd>A counter limiting concurrent operations; here 8 in-flight LLM calls.</dd></div>
+        <div class="term"><dt>Provider chain</dt><dd>Ordered failover across LLM providers ending in a fallback that can't fail.</dd></div>
+        <div class="term"><dt>Number containment</dt><dd>Validation that every number in LLM output appears in the computed facts.</dd></div>
+        <div class="term"><dt>Write amplification</dt><dd>One logical write causing many physical writes (rows, index entries, WAL).</dd></div>
+        <div class="term"><dt>Hot row</dt><dd>A single row updated by many concurrent transactions, which then queue on its lock.</dd></div>
+        <div class="term"><dt>Partitioning</dt><dd>Splitting one table into child tables by range (e.g. month) for cheap retention and smaller indexes.</dd></div>
+        <div class="term"><dt>Read replica</dt><dd>A streaming copy of the primary used for read-only queries.</dd></div>
+        <div class="term"><dt>CDC <small>change data capture</small></dt><dd>Reading the database's WAL to publish changes (e.g. Debezium), an alternative to an outbox table.</dd></div>
+        <div class="term"><dt>Embedded worker</dt><dd><code>RUN_EMBEDDED_WORKER=true</code>: the worker runs inside the API process for single-service deploys.</dd></div>
+        <div class="term"><dt>statement_timeout</dt><dd>Postgres-side cap (10 s) on any query, so a slow scan can't hold a pool connection forever.</dd></div>
+        <div class="term"><dt>Roaring bitmap</dt><dd>Compressed set of integers with very fast intersections; used for segment membership at 100M scale.</dd></div>
+      </dl>
+    </section>
+
+    <!-- ====================== PERF ====================== -->
+    <section id="perf">
+      <div class="sec-head">
+        <span class="eyebrow">Measured numbers</span>
+        <h2>Performance improvements already made</h2>
+        <p>Measured on an Apple M5 with the seeded dataset (50k customers, 370k events), a single api + embedded worker.</p>
+      </div>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Problem</th><th>Change</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>Batch ingest took N round trips</td><td>One tx: 2 <code>ANY</code> lookups + multi-row insert + <code>unnest</code> outbox; pipelined XADD</td><td class="num">640 → 50–60 ms / 500 events (~10×)</td></tr>
+          <tr><td>Full sort for top-K</td><td>Min-heap of size K</td><td class="num">238 → 9.3 ms, 112 MB → 341 KB</td></tr>
+          <tr><td>Score prefilter seq scan</td><td><code>idx_profiles_score</code> + <code>idx_profiles_last_event</code></td><td class="num">11.5 → 0.76 ms (~15×)</td></tr>
+          <tr><td>Serial worker loop</td><td>8 goroutines per batch</td><td class="num">~100–150 → ~800–1.2k msg/s</td></tr>
+          <tr><td>Analytics scanned events</td><td>Worker-maintained <code>campaign_metrics</code> rollup</td><td class="num">O(rollup rows)</td></tr>
+          <tr><td>Outbox grew ~10M rows/day</td><td>Delete on publish</td><td class="num">steady state ≈ 0 rows</td></tr>
+          <tr><td>Repeat AI analysis</td><td>Redis cache checked before metrics query</td><td class="num">~1 ms, 0 provider calls</td></tr>
+          <tr><td>Frequency cap = N queries</td><td>One batched <code>GROUP BY</code></td><td class="num">1 query per call</td></tr>
+          <tr><td>Rate limit under-priced batches</td><td>Token cost = <code>len(events)</code></td><td class="num">event rate bounded</td></tr>
+        </tbody>
+      </table></div>
+      <footer>Sourced from <code>docs/SYSTEM_DESIGN.md</code>, <code>AI_DESIGN.md</code>, <code>DEPLOYMENT.md</code>, <code>migrations/</code> and <code>internal/</code>. Scale-tier figures are estimates from the assumptions stated in that section.</footer>
+    </section>
+  </main>
+</div>
+</body>
+</html>
